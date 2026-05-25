@@ -207,6 +207,7 @@ local order = {
         "dictionary_lookup",
         "dictionary_lookup_history",
         "vocabbuilder",
+        "furigana_annotation",
         "----------------------------",
         "wikipedia_lookup",
         "wikipedia_history",
