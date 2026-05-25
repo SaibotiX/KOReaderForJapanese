@@ -128,36 +128,6 @@ ls -1 *.apk
 # e.g. koreader-android-arm64-<version>.apk
 ```
 
-## 4b. Sign the APK (REQUIRED — the build output is unsigned)
-
-`./kodev release android-arm64` produces an **unsigned** APK. Android 11+ (the
-Boox runs 13) rejects unsigned APKs with **"package appears to be invalid."** You
-must sign it with a v2/v3 signature using the SDK build-tools the build already
-downloaded (`base/toolchain/android-sdk-linux/build-tools/<ver>/`). You need a
-JRE/JDK for `apksigner`/`keytool` (if you built via Docker, run these inside the
-container or install `openjdk-17-jre-headless`, or use a portable JRE):
-
-```bash
-SDK=base/toolchain/android-sdk-linux
-BT=$SDK/build-tools/34.0.0
-
-# one-time: create a keystore (remember the password)
-keytool -genkeypair -v -keystore furigana.keystore -alias kor \
-    -keyalg RSA -keysize 2048 -validity 10000 \
-    -storepass furigana -keypass furigana -dname "CN=KOReader Furigana"
-
-# align, then sign (adds v1+v2+v3)
-$BT/zipalign -p -f 4 koreader-android-arm64-*.apk koreader-aligned.apk
-$BT/apksigner sign --ks furigana.keystore --ks-pass pass:furigana \
-    --out koreader-signed.apk koreader-aligned.apk
-
-# confirm v2/v3 = true
-$BT/apksigner verify -v koreader-signed.apk
-```
-
-Install `koreader-signed.apk` (not the raw build output). Keep `furigana.keystore`
-and reuse it for future builds, so reinstalls upgrade in place instead of clashing.
-
 ## 5. Install on the Boox GO 7
 
 Either:
@@ -196,12 +166,7 @@ The menu item only appears/enables when an EPUB is open.
 - **Position after toggle is approximate the first time** (ruby insertion shifts
   the internal DOM slightly). Switching back to the original is exact.
 - **Regenerating the dictionary** (only if you change the kuromoji data) needs
-  Node + your annotator checkout, and the kanji-grade data for selective furigana:
-  `node tools/fetch_kanji_grades.js` (once, downloads KANJIDIC2) then
-  `node tools/build_dict.js`.
-- **Selective furigana:** the **Furigana** menu has a *Reading level* submenu —
-  annotate all kanji, or only kanji at/above a chosen Japanese school grade
-  (KANJIDIC2 grades). Each level caches as a separate annotated copy.
+  Node + your annotator checkout: `node plugins/furigana.koplugin/tools/build_dict.js`.
 - **If ruby doesn't render**, check the EPUB really contained Japanese text and
   that KOReader's typography settings aren't hiding ruby.
 - **Re-validating the engine** off-device (optional): see the scripts in

@@ -43,45 +43,6 @@ global.fetch = function (url) {
 const wanakana = require(path.join(ANNOTATOR_DIR, 'scripts', 'wanakana.min.js'));
 const kuromoji = require(path.join(ANNOTATOR_DIR, 'scripts', 'kuromoji', 'build', 'kuromoji.js'));
 
-// Kanji -> KANJIDIC2 grade map (built by tools/fetch_kanji_grades.js). Used to
-// precompute each token's "word grade" so selective furigana needs no runtime
-// kanji table. Missing file => every kanji treated as rare (grade 9).
-let KANJI_GRADES = {};
-try {
-    KANJI_GRADES = JSON.parse(fs.readFileSync(path.join(__dirname, 'kanji_grades.json'), 'utf8'));
-} catch (e) {
-    console.warn('WARNING: kanji_grades.json not found — run tools/fetch_kanji_grades.js first. ' +
-        'All kanji will be graded 9 (selective furigana will be all-or-nothing).');
-}
-
-// Normalize KANJIDIC2 grade to a "school level" 1..9 where higher = harder:
-//   1-6 Kyoiku by grade, 7 = remaining Joyo (KANJIDIC 8), 8 = Jinmeiyo (9-10),
-//   9 = rare / non-Joyo (no grade).
-function normGrade(raw) {
-    if (raw >= 1 && raw <= 6) return raw;
-    if (raw === 8) return 7;
-    if (raw === 9 || raw === 10) return 8;
-    return 9;
-}
-
-function isKanjiCp(cp) {
-    return (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) ||
-           (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x20000 && cp <= 0x2FFFF);
-}
-
-// Hardest (max normalized grade) kanji in `surface`; 0 if it has no kanji.
-function wordGrade(surface) {
-    let max = 0;
-    for (const ch of surface) {
-        if (isKanjiCp(ch.codePointAt(0))) {
-            const raw = KANJI_GRADES[ch];
-            const g = raw === undefined ? 9 : normGrade(raw);
-            if (g > max) max = g;
-        }
-    }
-    return max;
-}
-
 // --- splitToken: copied verbatim from bridge.js (which copied it from index.js) -
 function splitToken(surfaceForm, readingHiragana) {
     let lastHiraganaIndex = null;
@@ -199,13 +160,12 @@ function build(tok) {
     writeRawTypedArray(path.join(OUT_DIR, 'tm_offset.bin'), tmOffset);
     writeRawTypedArray(path.join(OUT_DIR, 'tm_values.bin'), Int32Array.from(tmValues));
 
-    // tokens.bin: naturally-aligned 16-byte records, matching the Lua cdef
-    //   struct { uint32 html_off; uint16 html_len; int16 left,right,cost; uint8 grade; uint8 pad; }
+    // tokens.bin: naturally-aligned 12-byte records, matching the Lua cdef
+    //   struct { uint32_t html_off; uint16_t html_len; int16_t left; int16_t right; int16_t cost; }
     // Field order puts the uint32 at offset 0 so every field is naturally aligned
-    // (critical to avoid unaligned reads / SIGBUS on ARM). `grade` is the token's
-    // word grade (0 = not a ruby candidate; 1..9 = hardest kanji's school level).
+    // (critical to avoid unaligned reads / SIGBUS on ARM).
     const N = denseOffsets.length;
-    const REC = 16;
+    const REC = 12;
     const tokRec = Buffer.alloc(N * REC);
     const htmlParts = [];
     let htmlCursor = 0;
@@ -216,12 +176,7 @@ function build(tok) {
         const parts = getPosString(posId).split(',');
         const surface = parts[0];
         const reading = parts.length > 8 ? parts[8] : undefined;
-        const htmlStr = tokenHtml(surface, reading);
-        const isRuby = htmlStr !== surface;
-        // grade 0 for non-ruby tokens; otherwise the hardest kanji grade (>=1).
-        // A ruby token with no classified kanji defaults to 9 (kept at all levels).
-        const grade = isRuby ? (wordGrade(surface) || 9) : 0;
-        const html = Buffer.from(htmlStr, 'utf8');
+        const html = Buffer.from(tokenHtml(surface, reading), 'utf8');
         if (html.length > 0xFFFF) throw new Error('token html too long: ' + html.length);
         const base2 = d * REC;
         tokRec.writeUInt32LE(htmlCursor, base2);
@@ -229,7 +184,6 @@ function build(tok) {
         tokRec.writeInt16LE(left, base2 + 6);
         tokRec.writeInt16LE(right, base2 + 8);
         tokRec.writeInt16LE(cost, base2 + 10);
-        tokRec.writeUInt8(grade, base2 + 12);
         htmlParts.push(html);
         htmlCursor += html.length;
     }
