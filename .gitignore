@@ -41,3 +41,26 @@ i18n
 /.cproject
 /.project
 .gitignore~
+
+# ---- KOReaderForJapanese fork additions ----
+# build output & downloaded dependencies (koreader-base etc.)
+build/
+base/build/
+base/toolchain/
+base/thirdparty/
+platform/android/**/build/
+.gradle/
+**/.gradle/
+# packaged / compiled binaries
+*.apk
+*.zip
+*.tar.gz
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+*.keystore
+# editor / local tooling
+.idea/
+.claude/
