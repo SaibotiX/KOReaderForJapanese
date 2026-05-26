@@ -20,7 +20,7 @@ local bit = require("bit")
 local band, bor, lshift, rshift = bit.band, bit.bor, bit.lshift, bit.rshift
 
 ffi.cdef[[
-struct furi_tok { uint32_t html_off; uint16_t html_len; int16_t left; int16_t right; int16_t cost; };
+struct furi_tok { uint32_t html_off; uint16_t html_len; int16_t left; int16_t right; int16_t cost; uint8_t grade; uint8_t pad; };
 struct furi_unk { int16_t left; int16_t right; int16_t cost; };
 ]]
 
@@ -107,6 +107,13 @@ local function utf8_encode_into(out, k, cp)
     end
 end
 
+-- Encode codepoints cps[from .. from+count-1] back to a UTF-8 string.
+local function encode_range(cps, from, count)
+    local buf, k = {}, 0
+    for i = from, from + count - 1 do k = utf8_encode_into(buf, k, cps[i]) end
+    return string.char(unpack(buf, 1, k))
+end
+
 -- Split keeping empty fields (Lua has no built-in); mirrors JS str.split("\n").
 local function split_lines(s)
     local out, n, start = {}, 0, 1
@@ -124,8 +131,12 @@ end
 -- ------------------------------------------------------------------- loader --
 
 --- Load a dictionary directory produced by tools/build_dict.js.
-function Tokenizer.new(dict_dir)
+-- @param dict_dir path to the dict directory
+-- @param min_grade selective-furigana threshold: annotate a word only if its
+--   hardest-kanji grade is >= min_grade (1 = annotate everything, the default).
+function Tokenizer.new(dict_dir, min_grade)
     local self = setmetatable({}, Tokenizer)
+    self.min_grade = min_grade or 1
     local sep = dict_dir:sub(-1) == "/" and "" or "/"
     local function p(name) return dict_dir .. sep .. name end
 
@@ -140,12 +151,13 @@ function Tokenizer.new(dict_dir)
     self.cc = load_array(p("cc.bin"), "int16_t", 2)
     self.cc_backward = m.cc_backward
 
-    self.tokens = ffi.cast("struct furi_tok *", nil) -- placeholder for clarity
     do
         local data = read_file(p("tokens.bin"))
         local n = m.token_count
+        local rec = ffi.sizeof("struct furi_tok")
+        assert(#data == n * rec, "tokens.bin size mismatch")
         local arr = ffi.new("struct furi_tok[?]", n)
-        ffi.copy(arr, data, n * 12)
+        ffi.copy(arr, data, n * rec)
         self.tokens = arr
     end
     self.html = read_file(p("html.bin")) -- kept as a Lua string; we sub() out of it
@@ -166,6 +178,11 @@ function Tokenizer.new(dict_dir)
     self.default_class_id = m.default_class_id
 
     return self
+end
+
+--- Set the selective-furigana threshold (1 = annotate all kanji words).
+function Tokenizer:setMinGrade(min_grade)
+    self.min_grade = min_grade or 1
 end
 
 -- -------------------------------------------------------------- double array --
@@ -209,7 +226,7 @@ function Tokenizer:commonPrefixSearch(cps, w16, pos, hi, bytebuf)
                 local base = self:getBase(grand)
                 if base <= 0 and bi == nb then -- leaf, on a codepoint boundary
                     rn = rn + 1
-                    results[rn] = { len16 = utf16 + w16[cp], v = -base - 1 }
+                    results[rn] = { len16 = utf16 + w16[cp], v = -base - 1, ncp = cp - pos + 1 }
                 end
             end
         end
@@ -264,6 +281,7 @@ function Tokenizer:tokenizeSentence(cps, w16, lo, hi)
                         type = "KNOWN", token = d,
                         cost = t.cost, start_pos = rel, length = vocab[n].len16,
                         left_id = t.left, right_id = t.right,
+                        cp_start = cp, cp_count = vocab[n].ncp,
                         shortest_cost = math.huge,
                     })
                 end
@@ -380,9 +398,14 @@ function Tokenizer:tokenizeLine(line)
             local node = path[i]
             if node.type == "KNOWN" then
                 local t = self.tokens[node.token]
-                local off = tonumber(t.html_off)
                 on = on + 1
-                out[on] = self.html:sub(off + 1, off + tonumber(t.html_len))
+                if t.grade > 0 and t.grade < self.min_grade then
+                    -- ruby candidate below the selective threshold: plain surface
+                    out[on] = encode_range(cps, node.cp_start, node.cp_count)
+                else
+                    local off = tonumber(t.html_off)
+                    out[on] = self.html:sub(off + 1, off + tonumber(t.html_len))
+                end
             elseif node.type == "UNKNOWN" then
                 on = on + 1
                 out[on] = node.surface
