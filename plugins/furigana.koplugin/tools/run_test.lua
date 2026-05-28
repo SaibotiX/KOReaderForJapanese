@@ -26,6 +26,20 @@ local function read_lines(path)
     return out
 end
 
+-- We now compose multi-digit numbers (２０００ -> にせん) where bridge.js reads
+-- digit-by-digit. Normalize both sides by unwrapping any ruby whose base is all
+-- full-width digits, so number rendering doesn't break tokenization parity (a
+-- dedicated test checks the readings).
+local function is_fw_digits(s)
+    return s ~= "" and (s:gsub("\239\188[\144-\153]", "")) == ""
+end
+local function norm(s)
+    return (s:gsub("<ruby>([^<]*)<rt>.-</rt></ruby>", function(base)
+        if is_fw_digits(base) then return base end
+        return nil
+    end))
+end
+
 local samples = read_lines(samples_path)
 local expected = assert(loadfile(expected_path))()
 
@@ -35,7 +49,7 @@ local pass, fail = 0, 0
 for i = 1, #samples do
     local got = tok:annotate(samples[i])
     local want = expected[i]
-    if got == want then
+    if norm(got) == norm(want) then
         pass = pass + 1
     else
         fail = fail + 1
@@ -52,7 +66,7 @@ do
     full = full:gsub("\n$", "")
     local want = assert(loadfile(expected_block_path))()
     local got = tok:annotate(full)
-    if got == want then
+    if norm(got) == norm(want) then
         pass = pass + 1
         io.write("block test: OK\n")
     else

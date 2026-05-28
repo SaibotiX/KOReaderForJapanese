@@ -14,6 +14,7 @@ The heavy lifting lives in:
 @module koplugin.furigana
 ]]
 
+local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local InfoMessage = require("ui/widget/infomessage")
 local Trapper = require("ui/trapper")
@@ -23,6 +24,7 @@ local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
+local N_ = _.ngettext
 local T = require("ffi/util").template
 
 local EpubAnnotator = require("epubannotator")
@@ -47,16 +49,70 @@ function Furigana:init()
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
+    self:redirectFileBrowserToOriginal()
+    self:maybeAutoOpenAnnotated()
+end
+
+-- On opening a plain book, if it was last read with furigana, reopen the cached
+-- annotated copy automatically.
+function Furigana:maybeAutoOpenAnnotated()
+    if not (self.ui and self.ui.document) then return end
+    if self:isShowingAnnotated() then return end
+    if not self:isAutoOpenEnabled() then return end
+    if not self:isSupportedDoc() then return end
+    local src = self.ui.document.file
+    local annotated = self:getAutoMap()[src]
+    if not annotated then return end
+    if lfs.attributes(annotated, "mode") == "file" then
+        UIManager:nextTick(function() self:switchTo(annotated) end)
+    else
+        self:forgetAuto(src) -- cached copy is gone; drop stale state
+    end
+end
+
+-- When the open document is one of our annotated copies (living in the cache
+-- dir), make "leaving" the book return to the ORIGINAL book's folder instead of
+-- the cache directory. KOReader's Home / file-browser actions pass the current
+-- file's path to showFileManager, so we swap a cache path for the original on
+-- this reader instance only.
+function Furigana:redirectFileBrowserToOriginal()
+    if not (self.ui and self.ui.document and self:isShowingAnnotated()) then return end
+    if self.ui._furigana_fm_patched then return end
+    local src = self:readOriginalPath(self.ui.document.file)
+    if not src then return end
+
+    local ui = self.ui
+    local cache_prefix = self.cache_dir
+    local orig_show = ui.showFileManager
+    ui._furigana_fm_patched = true
+    ui.showFileManager = function(this, file, selected_files)
+        if file and file:sub(1, #cache_prefix) == cache_prefix then
+            file = src -- open the original's folder (and highlight it)
+        end
+        return orig_show(this, file, selected_files)
+    end
+    -- Also cover the no-argument path (some back gestures).
+    if ui.setLastDirForFileBrowser then
+        local dir = src:match("(.*)/")
+        if dir then ui:setLastDirForFileBrowser(dir) end
+    end
 end
 
 -- ----------------------------------------------------------------- helpers --
 
-function Furigana:isEpub()
+-- Supported = a crengine reflowable document we can rewrite: EPUB or standalone
+-- HTML. (Paged formats — PDF/DjVu/CBZ — are excluded.)
+function Furigana:isSupportedDoc()
     local doc = self.ui and self.ui.document
     if not doc then return false end
-    if doc.info and doc.info.has_pages then return false end -- paged formats (pdf/djvu/cbz)
-    local file = doc.file or ""
-    return file:lower():match("%.epub$") ~= nil
+    if doc.info and doc.info.has_pages then return false end
+    local file = (doc.file or ""):lower()
+    return file:match("%.epub$") ~= nil or file:match("%.html?$") ~= nil
+end
+
+-- "epub" or "html" — the format of the annotated copy for a given source.
+local function annotated_ext(src)
+    return src:lower():match("%.epub$") and "epub" or "html"
 end
 
 function Furigana:isShowingAnnotated()
@@ -74,13 +130,45 @@ function Furigana:annotatedPathFor(src)
     local dict_version = self:getDictVersion()
     local key = hash_str(src) .. "_" .. size .. "_" .. mtime
         .. "_v" .. dict_version .. "_g" .. self:getMinGrade()
-    return self.cache_dir .. "/" .. key .. ".epub"
+        .. "_r" .. (self:getReplaceRuby() and 1 or 0)
+    return self.cache_dir .. "/" .. key .. "." .. annotated_ext(src)
 end
 
 -- Selective-furigana level: annotate a word only if its hardest kanji's grade is
 -- >= this value. 1 = annotate every kanji word (default).
 function Furigana:getMinGrade()
     return G_reader_settings:readSetting("furigana_min_grade") or 1
+end
+
+-- When true, strip the book's own embedded furigana before annotating, so only
+-- our readings remain (and the level setting governs every kanji).
+function Furigana:getReplaceRuby()
+    return G_reader_settings:isTrue("furigana_replace_native_ruby")
+end
+
+-- "Sticky furigana": remember, per original book, the annotated copy last read,
+-- so opening the plain book reopens its furigana version automatically. Cleared
+-- when the user turns furigana off for that book.
+function Furigana:isAutoOpenEnabled()
+    return G_reader_settings:nilOrTrue("furigana_auto_open_enabled")
+end
+
+function Furigana:getAutoMap()
+    return G_reader_settings:readSetting("furigana_auto_map") or {}
+end
+
+function Furigana:rememberAuto(src, annotated)
+    local m = self:getAutoMap()
+    m[src] = annotated
+    G_reader_settings:saveSetting("furigana_auto_map", m)
+end
+
+function Furigana:forgetAuto(src)
+    local m = self:getAutoMap()
+    if m[src] ~= nil then
+        m[src] = nil
+        G_reader_settings:saveSetting("furigana_auto_map", m)
+    end
 end
 
 function Furigana:getDictVersion()
@@ -117,18 +205,212 @@ end
 
 -- ------------------------------------------------------------------- toggle --
 
+-- Block-level HTML tags that visually break the text flow. crengine's text
+-- search runs within a block, so the marker must not span across one or it
+-- won't be findable in the target.
+local FURI_BLOCK_TAGS = {
+    p = true, br = true, div = true, li = true, td = true, tr = true,
+    h1 = true, h2 = true, h3 = true, h4 = true, h5 = true, h6 = true,
+    blockquote = true, hr = true, section = true, article = true,
+    aside = true, pre = true,
+}
+
+-- Truncate `html` just before the first block-level tag that follows any text
+-- content (leading wrapper tags are ignored). Keeps the marker inside one
+-- paragraph/line.
+local function clip_to_first_block(html)
+    local i, got_text, len = 1, false, #html
+    while i <= len do
+        local lt = html:find("<", i, true)
+        if not lt then return html end
+        if lt > i then got_text = true end
+        local gt = html:find(">", lt + 1, true)
+        if not gt then return html end
+        if got_text then
+            local name = html:sub(lt, gt):match("^<%s*/?%s*([%a][%w]*)")
+            if name and FURI_BLOCK_TAGS[name:lower()] then
+                return html:sub(1, lt - 1)
+            end
+        end
+        i = gt + 1
+    end
+    return html
+end
+
+-- Reading position as a 0..1 fraction of the book. Page counts differ between
+-- the original and an annotated copy (and between levels), but the fraction is
+-- approximately preserved because ruby is added throughout — close enough to
+-- pick, among several text matches, the one nearest where the reader actually is.
+local function book_fraction(doc)
+    if not doc then return nil end
+    local ok, frac = pcall(function()
+        local total = doc:getPageCount()
+        local cur = doc:getCurrentPage()
+        if total and total > 0 and cur then return cur / total end
+        return nil
+    end)
+    return ok and frac or nil
+end
+
+-- Fraction of the book at which an xpointer sits, in the given document.
+local function xp_fraction(doc, xp)
+    local ok, frac = pcall(function()
+        local total = doc:getPageCount()
+        local pg = doc:getPageFromXPointer(xp)
+        if total and total > 0 and pg then return pg / total end
+        return nil
+    end)
+    return ok and frac or nil
+end
+
+-- Capture a marker of clean base text starting at the current top-of-page,
+-- regardless of whether the source is plain or already annotated. Uses
+-- getHTMLFromXPointers + clip-to-block + strip_ruby + tag-strip so any
+-- publisher/our furigana readings are removed and the marker stays inside one
+-- paragraph (so crengine's search can find it whole in the new document).
+function Furigana:capturePageMarker()
+    if not (self.ui and self.ui.rolling and self.ui.document) then return nil end
+    local doc = self.ui.document
+    if not doc.getHTMLFromXPointers then return nil end
+    local ok, marker = pcall(function()
+        local top_xp = self.ui.rolling:getBookLocation()
+        if not top_xp then return nil end
+        local end_xp = top_xp
+        -- Grab a generous window. On an annotated source, getNextVisibleChar
+        -- counts the ruby <rt> reading characters too, so this shrinks after
+        -- strip_ruby; clip_to_first_block also caps it at the paragraph end.
+        for _ = 1, 400 do
+            local nxt = doc:getNextVisibleChar(end_xp)
+            if not nxt or nxt == end_xp then break end
+            end_xp = nxt
+        end
+        if end_xp == top_xp then return nil end
+        local html = doc:getHTMLFromXPointers(top_xp, end_xp, 0x1001)
+        if not html or html == "" then return nil end
+        html = clip_to_first_block(html)        -- never cross a block boundary
+        html = EpubAnnotator.strip_ruby(html)
+        local text = (html:gsub("<[^>]*>", "")) -- drop remaining tags
+        -- Decode the common named entities so the marker matches crengine's
+        -- rendered text on the target side.
+        text = text:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
+                   :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+        text = util.cleanupSelectedText(text)
+        text = (text:gsub("[\r\n]+", " "):gsub("%s%s+", " "))
+        text = (text:gsub("^%s+", ""):gsub("%s+$", ""))
+        if #text < 8 then return nil end           -- too short to be unique
+        if #text > 600 then text = text:sub(1, 600) end -- search efficiently
+        return text
+    end)
+    if ok then return marker end
+    logger.dbg("furigana: capturePageMarker failed:", marker)
+    return nil
+end
+
+-- How far (in book fraction) the best match may sit from the reader's position
+-- before we treat the jump as low-confidence and offer a manual chooser. Ruby
+-- drift between copies is typically < 5%; a chapters-apart mismatch is >> 10%.
+local FURI_CONFIDENT_FRAC = 0.10
+
+-- Find the marker in the new document and jump to the occurrence NEAREST the
+-- reader's previous position (by book fraction) — not the first in the book,
+-- which is what caused jumps to page 1 / earlier chapters when the marker text
+-- recurs. A single match is unambiguous; if several remain and we can't place
+-- them confidently, we still jump to the best guess and offer a chooser.
+function Furigana:restorePosition(new_ui, marker, fallback_xp, source_frac)
+    if not (new_ui and new_ui.rolling and new_ui.document) then return end
+    local doc = new_ui.document
+
+    local results
+    if marker and doc.findAllText then
+        local ok, res = pcall(function()
+            -- pattern, case_insensitive, nb_context_words, max_hits, regex.
+            -- High max_hits so a recurring marker's true region isn't truncated
+            -- away in document order before nearest-by-fraction can pick it.
+            return doc:findAllText(marker, false, 0, 1000, false)
+        end)
+        if ok then results = res end
+    end
+
+    if type(results) ~= "table" or not results[1] then
+        if fallback_xp then pcall(function() new_ui.rolling:onGotoXPointer(fallback_xp) end) end
+        return
+    end
+
+    if #results == 1 then -- unambiguous
+        pcall(function() new_ui.rolling:onGotoXPointer(results[1].start) end)
+        return
+    end
+
+    -- Several matches: choose the one closest to where the reader was.
+    local best, best_d = nil, nil
+    if source_frac then
+        for _, r in ipairs(results) do
+            local f = xp_fraction(doc, r.start)
+            if f then
+                local d = math.abs(f - source_frac)
+                if not best_d or d < best_d then best, best_d = r, d end
+            end
+        end
+    end
+    best = best or results[1]
+    pcall(function() new_ui.rolling:onGotoXPointer(best.start) end)
+
+    -- If we couldn't place it confidently, let the user pick the right page.
+    if (not source_frac) or (best_d and best_d > FURI_CONFIDENT_FRAC) then
+        self:showMatchChooser(new_ui, results, source_frac)
+    end
+end
+
+-- Show all marker matches (nearest to the reader's position first); tap to jump.
+function Furigana:showMatchChooser(new_ui, results, source_frac)
+    local KeyValuePage = require("ui/widget/keyvaluepage")
+    local doc = new_ui.document
+
+    local rows = {}
+    for _, r in ipairs(results) do
+        rows[#rows + 1] = { r = r, page = doc:getPageFromXPointer(r.start) or 0,
+                            f = xp_fraction(doc, r.start) }
+    end
+    if source_frac then
+        table.sort(rows, function(a, b)
+            local da = a.f and math.abs(a.f - source_frac) or math.huge
+            local db = b.f and math.abs(b.f - source_frac) or math.huge
+            return da < db
+        end)
+    else
+        table.sort(rows, function(a, b) return a.page < b.page end)
+    end
+
+    local kv = {}
+    for _, row in ipairs(rows) do
+        local snippet = ""
+        local ok, s = pcall(function() return doc:getTextFromXPointers(row.r.start, row.r["end"], false) end)
+        if ok and s then snippet = s:gsub("[\r\n]+", " "):sub(1, 40) end
+        kv[#kv + 1] = {
+            T(_("Page %1"), row.page),
+            snippet,
+            callback = function()
+                pcall(function() new_ui.rolling:onGotoXPointer(row.r.start) end)
+            end,
+        }
+    end
+    UIManager:show(KeyValuePage:new{
+        title = T(N_("Furigana: %1 possible position — tap to choose",
+                     "Furigana: %1 possible positions — tap to choose", #results), #results),
+        kv_pairs = kv,
+    })
+end
+
 -- Reopen `path` in place, restoring the current reading position.
 function Furigana:switchTo(path)
-    local saved_xp
+    local saved_xp, marker, source_frac
     if self.ui and self.ui.rolling then
         saved_xp = self.ui.rolling:getBookLocation()
+        marker = self:capturePageMarker()
+        source_frac = book_fraction(self.ui.document) -- measured in the source doc
     end
     self.ui:switchDocument(path, false, function(new_ui)
-        if saved_xp and new_ui and new_ui.rolling then
-            -- The annotated DOM differs slightly (ruby inserted), so the xpointer
-            -- may resolve to a nearby position rather than the exact spot.
-            pcall(function() new_ui.rolling:onGotoXPointer(saved_xp) end)
-        end
+        self:restorePosition(new_ui, marker, saved_xp, source_frac)
     end)
 end
 
@@ -145,11 +427,17 @@ function Furigana:generateThenSwitch(src, annotated)
 
         local tmp = annotated .. ".tmp"
         local aborted = false
-        local ok, err = EpubAnnotator.annotate_epub(tok, src, tmp, function(done, total)
+        local progress = function(done, total)
             local go_on = Trapper:info(T(_("Adding furigana… %1 / %2"), done, total))
             if not go_on then aborted = true; return false end
             return true
-        end)
+        end
+        local ok, err
+        if annotated_ext(src) == "epub" then
+            ok, err = EpubAnnotator.annotate_epub(tok, src, tmp, progress, self:getReplaceRuby())
+        else
+            ok, err = EpubAnnotator.annotate_html_file(tok, src, tmp, progress, self:getReplaceRuby())
+        end
         Trapper:reset()
         tok = nil -- allow the dictionary to be collected
 
@@ -166,6 +454,7 @@ function Furigana:generateThenSwitch(src, annotated)
 
         os.rename(tmp, annotated)
         self:writeOriginalPath(annotated, src)
+        self:rememberAuto(src, annotated) -- sticky furigana for this book
         -- Defer the document switch until after this coroutine unwinds.
         UIManager:nextTick(function() self:switchTo(annotated) end)
     end)
@@ -175,6 +464,7 @@ end
 function Furigana:openAnnotated(src)
     local annotated = self:annotatedPathFor(src)
     if lfs.attributes(annotated, "mode") == "file" then
+        self:rememberAuto(src, annotated) -- sticky furigana for this book
         self:switchTo(annotated) -- cached: instant
     else
         self:generateThenSwitch(src, annotated)
@@ -191,13 +481,14 @@ function Furigana:currentSourcePath()
 end
 
 function Furigana:onToggleFurigana(touchmenu_instance)
-    if not self:isEpub() then return end
+    if not self:isSupportedDoc() then return end
     if touchmenu_instance then touchmenu_instance:closeMenu() end
 
     if self:isShowingAnnotated() then
-        -- Turn off: return to the original book.
+        -- Turn off: return to the original book and stop auto-reopening it.
         local src = self:readOriginalPath(self.ui.document.file)
         if src and lfs.attributes(src, "mode") == "file" then
+            self:forgetAuto(src)
             self:switchTo(src)
         else
             UIManager:show(InfoMessage:new{ text = _("Could not find the original book to switch back to.") })
@@ -206,6 +497,11 @@ function Furigana:onToggleFurigana(touchmenu_instance)
     end
 
     self:openAnnotated(self.ui.document.file)
+end
+
+function Furigana:onToggleAutoOpen(touchmenu_instance)
+    G_reader_settings:saveSetting("furigana_auto_open_enabled", not self:isAutoOpenEnabled())
+    if touchmenu_instance then touchmenu_instance:updateItems() end
 end
 
 -- Change the selective level. If a furigana copy is currently showing, switch to
@@ -220,6 +516,63 @@ function Furigana:onSetMinGrade(min_grade, touchmenu_instance)
             self:openAnnotated(src)
         end
     end
+end
+
+-- Toggle "replace the book's own furigana". Regenerates if currently showing.
+function Furigana:onToggleReplaceRuby(touchmenu_instance)
+    G_reader_settings:flipNilOrFalse("furigana_replace_native_ruby")
+    if touchmenu_instance then touchmenu_instance:updateItems() end
+    if self:isShowingAnnotated() then
+        local src = self:readOriginalPath(self.ui.document.file)
+        if src and lfs.attributes(src, "mode") == "file" then
+            if touchmenu_instance then touchmenu_instance:closeMenu() end
+            self:openAnnotated(src)
+        end
+    end
+end
+
+-- Delete cached annotated copies (and their .src/.tmp siblings) to free storage.
+-- Keeps the currently-open annotated copy (and its sidecar) so the toggle still
+-- works while reading it.
+function Furigana:clearCache()
+    local keep = {}
+    if self:isShowingAnnotated() then
+        local cur = self.ui.document.file
+        keep[cur] = true
+        keep[self:srcSidecarPath(cur)] = true
+    end
+
+    local files, total = {}, 0
+    for f in lfs.dir(self.cache_dir) do
+        if f ~= "." and f ~= ".." then
+            local p = self.cache_dir .. "/" .. f
+            if lfs.attributes(p, "mode") == "file" and not keep[p] then
+                files[#files + 1] = p
+                total = total + (lfs.attributes(p, "size") or 0)
+            end
+        end
+    end
+
+    if #files == 0 then
+        UIManager:show(InfoMessage:new{ text = _("The furigana cache is already empty.") })
+        return
+    end
+
+    local mb = string.format("%.1f", total / 1048576)
+    UIManager:show(ConfirmBox:new{
+        text = T(N_("Delete %1 cached furigana file (%2 MB)?",
+                    "Delete %1 cached furigana files (%2 MB)?", #files), #files, mb),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            local removed = 0
+            for _, p in ipairs(files) do
+                if os.remove(p) then removed = removed + 1 end
+            end
+            UIManager:show(InfoMessage:new{
+                text = T(N_("Deleted %1 file.", "Deleted %1 files.", removed), removed),
+            })
+        end,
+    })
 end
 
 -- --------------------------------------------------------------------- menu --
@@ -262,7 +615,7 @@ function Furigana:addToMainMenu(menu_items)
         sub_item_table = {
             {
                 text = _("Show furigana for current book"),
-                enabled_func = function() return self:isEpub() end,
+                enabled_func = function() return self:isSupportedDoc() end,
                 checked_func = function() return self:isShowingAnnotated() end,
                 callback = function(touchmenu_instance)
                     self:onToggleFurigana(touchmenu_instance)
@@ -273,11 +626,37 @@ The readings are generated on-device; the first run on a book may take a little 
             },
             {
                 text = _("Reading level"),
-                separator = false,
                 sub_item_table_func = function() return self:genLevelItems() end,
                 help_text = _([[Choose which kanji get furigana, by Japanese school grade. "All kanji" annotates everything; higher levels show readings only for harder/less common kanji.
 
 Changing the level regenerates the annotated copy (cached per level).]]),
+            },
+            {
+                text = _("Replace the book's own furigana"),
+                checked_func = function() return self:getReplaceRuby() end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:onToggleReplaceRuby(touchmenu_instance)
+                end,
+                help_text = _([[Some books ship with their own furigana. By default we keep it and only add readings where it is missing.
+
+Enable this to strip the book's embedded furigana first, so every reading is ours and obeys the reading-level setting (uniform style, no publisher readings on easy kanji).]]),
+            },
+            {
+                text = _("Reopen furigana version automatically"),
+                checked_func = function() return self:isAutoOpenEnabled() end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:onToggleAutoOpen(touchmenu_instance)
+                end,
+                help_text = _("When you open a book that you last read with furigana, automatically reopen the furigana version. Turning furigana off for a book stops this until you turn it on again."),
+            },
+            {
+                text = _("Clear furigana cache"),
+                keep_menu_open = true,
+                separator = true,
+                callback = function() self:clearCache() end,
+                help_text = _("Delete cached annotated copies to free storage. The book you are currently reading with furigana is kept; everything else is removed and regenerated on demand."),
             },
         },
     }

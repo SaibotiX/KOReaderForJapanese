@@ -376,6 +376,46 @@ function Tokenizer:tokenizeSentence(cps, w16, lo, hi)
     return rev
 end
 
+-- --------------------------------------------------------- number readings --
+-- kuromoji reads full-width digits one at a time (２０００ -> に・ぜろ・ぜろ・ぜろ).
+-- We merge digit runs and read the whole number (にせん), with the usual
+-- irregular sounds. 兆-level rendaku (一兆→いっちょう) is not applied (rare).
+
+local DIGIT_R = { [0] = "", "いち", "に", "さん", "よん", "ご", "ろく", "なな", "はち", "きゅう" }
+local HUND_R  = { [0] = "", "ひゃく", "にひゃく", "さんびゃく", "よんひゃく", "ごひゃく",
+                  "ろっぴゃく", "ななひゃく", "はっぴゃく", "きゅうひゃく" }
+local THOU_R  = { [0] = "", "せん", "にせん", "さんぜん", "よんせん", "ごせん",
+                  "ろくせん", "ななせん", "はっせん", "きゅうせん" }
+local GROUP_SUFFIX = { [0] = "", "まん", "おく", "ちょう" }
+
+local function tens_reading(d)
+    if d == 0 then return "" elseif d == 1 then return "じゅう" else return DIGIT_R[d] .. "じゅう" end
+end
+
+local function group_reading(g) -- g in 0..9999
+    local s = THOU_R[math.floor(g / 1000) % 10] .. HUND_R[math.floor(g / 100) % 10]
+        .. tens_reading(math.floor(g / 10) % 10)
+    local u = g % 10
+    if u > 0 then s = s .. DIGIT_R[u] end
+    return s
+end
+
+-- Japanese reading of a non-negative integer; nil if too large to read exactly.
+local function number_reading(value)
+    if value == 0 then return "ぜろ" end
+    local parts, gi = {}, 0
+    while value > 0 and gi <= 3 do
+        local g = value % 10000
+        if g > 0 then parts[gi] = group_reading(g) .. GROUP_SUFFIX[gi] end
+        value = math.floor(value / 10000)
+        gi = gi + 1
+    end
+    if value > 0 then return nil end -- beyond 兆 range
+    local out = {}
+    for i = 3, 0, -1 do if parts[i] then out[#out + 1] = parts[i] end end
+    return table.concat(out)
+end
+
 -- ----------------------------------------------------------- public surface --
 
 local function is_punct(cp) return cp == 0x3001 or cp == 0x3002 end -- 、。
@@ -387,6 +427,57 @@ function Tokenizer:tokenizeLine(line)
     if n == 0 then return "" end
 
     local out, on = {}, 0
+    local min_grade = self.min_grade
+
+    local function emit_known(node)
+        local t = self.tokens[node.token]
+        if t.grade > 0 and t.grade < min_grade then
+            return encode_range(cps, node.cp_start, node.cp_count) -- below threshold: plain
+        end
+        local off = tonumber(t.html_off)
+        return self.html:sub(off + 1, off + tonumber(t.html_len))
+    end
+
+    -- A KNOWN node whose surface is entirely full-width digits (０-９).
+    local function is_digit_node(node)
+        if node.type ~= "KNOWN" then return false end
+        for i = node.cp_start, node.cp_start + node.cp_count - 1 do
+            local cp = cps[i]
+            if cp < 0xFF10 or cp > 0xFF19 then return false end
+        end
+        return true
+    end
+
+    -- Emit a merged run of digit nodes as one number, or fall back to per-digit.
+    local function flush_digits(run)
+        if #run == 0 then return end
+        local cp_list, ascii = {}, {}
+        for _, node in ipairs(run) do
+            for i = node.cp_start, node.cp_start + node.cp_count - 1 do
+                cp_list[#cp_list + 1] = cps[i]
+                ascii[#ascii + 1] = string.char(48 + (cps[i] - 0xFF10))
+            end
+        end
+        local digits = table.concat(ascii)
+        -- Compose only true multi-digit numbers without a leading zero (so years,
+        -- prices… read as numbers, but codes like ００７ stay per-digit).
+        if #digits >= 2 and digits:sub(1, 1) ~= "0" and #digits <= 15 then
+            local reading = number_reading(tonumber(digits))
+            if reading then
+                local surface = encode_range(cp_list, 1, #cp_list)
+                on = on + 1
+                -- numbers have no kanji => grade 1 => ruby only at the "All" level
+                if min_grade <= 1 then
+                    out[on] = "<ruby>" .. surface .. "<rt>" .. reading .. "</rt></ruby>"
+                else
+                    out[on] = surface
+                end
+                return
+            end
+        end
+        for _, node in ipairs(run) do on = on + 1; out[on] = emit_known(node) end
+    end
+
     local lo = 1
     while lo <= n do
         -- splitByPunctuation: sentence ends at the first 、/。 (inclusive)
@@ -394,23 +485,21 @@ function Tokenizer:tokenizeLine(line)
         for i = lo, n do if is_punct(cps[i]) then hi = i; break end end
 
         local path = self:tokenizeSentence(cps, w16, lo, hi)
+        local run = {}
         for i = 1, #path do
             local node = path[i]
-            if node.type == "KNOWN" then
-                local t = self.tokens[node.token]
-                on = on + 1
-                if t.grade > 0 and t.grade < self.min_grade then
-                    -- ruby candidate below the selective threshold: plain surface
-                    out[on] = encode_range(cps, node.cp_start, node.cp_count)
-                else
-                    local off = tonumber(t.html_off)
-                    out[on] = self.html:sub(off + 1, off + tonumber(t.html_len))
+            if is_digit_node(node) then
+                run[#run + 1] = node
+            else
+                flush_digits(run); run = {}
+                if node.type == "KNOWN" then
+                    on = on + 1; out[on] = emit_known(node)
+                elseif node.type == "UNKNOWN" then
+                    on = on + 1; out[on] = node.surface
                 end
-            elseif node.type == "UNKNOWN" then
-                on = on + 1
-                out[on] = node.surface
             end
         end
+        flush_digits(run)
         lo = hi + 1
     end
     return table.concat(out)

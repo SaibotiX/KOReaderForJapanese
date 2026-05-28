@@ -127,12 +127,35 @@ function splitToken(surfaceForm, readingHiragana) {
     return outputHtml;
 }
 
-// Per-token output, exactly matching bridge.js's annotate() decision for one token.
+// A ruby base worth keeping must contain something a reader can't already read:
+// a kanji, digit, or Latin letter. A base that is empty or entirely kana
+// (hiragana/katakana/ー) is pointless — and the all-kana case is where the
+// original splitToken emits a broken empty-base ruby (e.g. なー -> floating なあ).
+function isAllKana(s) {
+    if (s === "") return true;
+    for (const ch of s) {
+        const c = ch.codePointAt(0);
+        const kana = (c >= 0x3040 && c <= 0x309F) || (c >= 0x30A0 && c <= 0x30FF) ||
+            (c >= 0xFF66 && c <= 0xFF9F);
+        if (!kana) return false;
+    }
+    return true;
+}
+
+// Drop any <ruby> whose base is empty or all-kana, keeping the base text. Shared
+// with tools/gen_expected.js so our output and the bridge.js ground truth agree.
+function unwrapKanaRuby(html) {
+    return html.replace(/<ruby>(.*?)<rt>.*?<\/rt><\/ruby>/g,
+        (m, base) => (isAllKana(base) ? base : m));
+}
+
+// Per-token output: bridge.js's annotate() decision for one token, then with
+// pointless kana ruby unwrapped.
 function tokenHtml(surface, readingKatakana) {
     if (readingKatakana === undefined) return surface;
     const readingHiragana = wanakana.toHiragana(readingKatakana);
     if (surface !== readingHiragana && surface !== readingKatakana) {
-        return splitToken(surface, readingHiragana);
+        return unwrapKanaRuby(splitToken(surface, readingHiragana));
     }
     return surface;
 }
@@ -219,8 +242,9 @@ function build(tok) {
         const htmlStr = tokenHtml(surface, reading);
         const isRuby = htmlStr !== surface;
         // grade 0 for non-ruby tokens; otherwise the hardest kanji grade (>=1).
-        // A ruby token with no classified kanji defaults to 9 (kept at all levels).
-        const grade = isRuby ? (wordGrade(surface) || 9) : 0;
+        // A ruby token with no kanji (full-width numbers/letters) gets grade 1,
+        // so it only shows at the "All kanji" level, not at selective levels.
+        const grade = isRuby ? (wordGrade(surface) || 1) : 0;
         const html = Buffer.from(htmlStr, 'utf8');
         if (html.length > 0xFFFF) throw new Error('token html too long: ' + html.length);
         const base2 = d * REC;

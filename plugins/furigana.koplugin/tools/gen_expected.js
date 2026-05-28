@@ -13,6 +13,23 @@ const BRIDGE = path.join(ANNOTATOR_DIR, 'bridge.js');
 const samplesPath = process.argv[2] || path.join(__dirname, 'samples.txt');
 const outPath = process.argv[3] || path.join(__dirname, 'expected.lua');
 
+// Match the build's kana-ruby cleanup (build_dict.js) so the ground truth
+// reflects our intended output, not the original annotator's empty-base ruby.
+function isAllKana(s) {
+    if (s === "") return true;
+    for (const ch of s) {
+        const c = ch.codePointAt(0);
+        const kana = (c >= 0x3040 && c <= 0x309F) || (c >= 0x30A0 && c <= 0x30FF) ||
+            (c >= 0xFF66 && c <= 0xFF9F);
+        if (!kana) return false;
+    }
+    return true;
+}
+function unwrapKanaRuby(html) {
+    return html.replace(/<ruby>(.*?)<rt>.*?<\/rt><\/ruby>/g,
+        (m, base) => (isAllKana(base) ? base : m));
+}
+
 // Lua double-quoted string literal; non-ASCII left as-is (file is written UTF-8,
 // Lua treats it as a byte string).
 function luaStr(s) {
@@ -44,7 +61,7 @@ rl.on('line', (line) => {
         if (line === '') return;
         const resp = JSON.parse(line);
         if (!resp.ok) { console.error('bridge error:', resp.error); process.exit(1); }
-        results.push(resp.html);
+        results.push(unwrapKanaRuby(resp.html));
         if (results.length === requests.length) {
             const block = results.pop(); // last one is the whole-block result
             const lua = 'return {\n' + results.map((r) => '  ' + luaStr(r) + ',').join('\n') + '\n}\n';

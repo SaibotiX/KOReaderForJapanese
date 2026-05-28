@@ -35,6 +35,17 @@ check("私 plain at level 7",     not has_ruby("私", 7))
 check("誰 ruby at level 7",      has_ruby("誰", 7))
 check("誰 plain at level 8",     not has_ruby("誰", 8))
 
+io.write("== numbers/letters only at 'All' (grade 1) ==\n")
+check("ＡＢＣ ruby at level 1",   has_ruby("ＡＢＣ", 1))
+check("ＡＢＣ plain at level 2",  not has_ruby("ＡＢＣ", 2))
+check("１２３ ruby at level 1",   has_ruby("１２３", 1))
+check("１２３ plain at level 2",  not has_ruby("１２３", 2))
+
+io.write("== all-kana (chōonpu) never annotated ==\n")
+check("すごいなー plain at level 1", not has_ruby("すごいなー", 1))
+check("はあー plain at level 1",     not has_ruby("はあー", 1))
+check("あー plain at level 1",       not has_ruby("あー", 1))
+
 io.write("== monotonic ruby count over sample lines ==\n")
 local samples = {}
 do

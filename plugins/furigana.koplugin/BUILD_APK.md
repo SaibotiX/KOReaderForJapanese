@@ -202,6 +202,9 @@ The menu item only appears/enables when an EPUB is open.
 - **Selective furigana:** the **Furigana** menu has a *Reading level* submenu —
   annotate all kanji, or only kanji at/above a chosen Japanese school grade
   (KANJIDIC2 grades). Each level caches as a separate annotated copy.
+- **Replace the book's own furigana:** a toggle in the **Furigana** menu. Off
+  (default) keeps publisher ruby and only adds ours where missing; on strips the
+  book's embedded ruby first so every reading is ours and obeys the level.
 - **If ruby doesn't render**, check the EPUB really contained Japanese text and
   that KOReader's typography settings aren't hiding ruby.
 - **Re-validating the engine** off-device (optional): see the scripts in
