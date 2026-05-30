@@ -237,32 +237,6 @@ local function clip_to_first_block(html)
     return html
 end
 
--- Reading position as a 0..1 fraction of the book. Page counts differ between
--- the original and an annotated copy (and between levels), but the fraction is
--- approximately preserved because ruby is added throughout — close enough to
--- pick, among several text matches, the one nearest where the reader actually is.
-local function book_fraction(doc)
-    if not doc then return nil end
-    local ok, frac = pcall(function()
-        local total = doc:getPageCount()
-        local cur = doc:getCurrentPage()
-        if total and total > 0 and cur then return cur / total end
-        return nil
-    end)
-    return ok and frac or nil
-end
-
--- Fraction of the book at which an xpointer sits, in the given document.
-local function xp_fraction(doc, xp)
-    local ok, frac = pcall(function()
-        local total = doc:getPageCount()
-        local pg = doc:getPageFromXPointer(xp)
-        if total and total > 0 and pg then return pg / total end
-        return nil
-    end)
-    return ok and frac or nil
-end
-
 -- Capture a marker of clean base text starting at the current top-of-page,
 -- regardless of whether the source is plain or already annotated. Uses
 -- getHTMLFromXPointers + clip-to-block + strip_ruby + tag-strip so any
@@ -276,10 +250,7 @@ function Furigana:capturePageMarker()
         local top_xp = self.ui.rolling:getBookLocation()
         if not top_xp then return nil end
         local end_xp = top_xp
-        -- Grab a generous window. On an annotated source, getNextVisibleChar
-        -- counts the ruby <rt> reading characters too, so this shrinks after
-        -- strip_ruby; clip_to_first_block also caps it at the paragraph end.
-        for _ = 1, 400 do
+        for _ = 1, 200 do -- larger window than needed; strip_ruby may shrink it
             local nxt = doc:getNextVisibleChar(end_xp)
             if not nxt or nxt == end_xp then break end
             end_xp = nxt
@@ -306,111 +277,61 @@ function Furigana:capturePageMarker()
     return nil
 end
 
--- How far (in book fraction) the best match may sit from the reader's position
--- before we treat the jump as low-confidence and offer a manual chooser. Ruby
--- drift between copies is typically < 5%; a chapters-apart mismatch is >> 10%.
-local FURI_CONFIDENT_FRAC = 0.10
-
--- Find the marker in the new document and jump to the occurrence NEAREST the
--- reader's previous position (by book fraction) — not the first in the book,
--- which is what caused jumps to page 1 / earlier chapters when the marker text
--- recurs. A single match is unambiguous; if several remain and we can't place
--- them confidently, we still jump to the best guess and offer a chooser.
-function Furigana:restorePosition(new_ui, marker, fallback_xp, source_frac)
+-- Find the marker text in the new document and jump there. With a single hit
+-- the jump is silent; with several, we still jump to the earliest match (the
+-- usual right answer) but also show a chooser so the user can pick another.
+function Furigana:restorePosition(new_ui, marker, fallback_xp)
     if not (new_ui and new_ui.rolling and new_ui.document) then return end
-    local doc = new_ui.document
-
-    local results
-    if marker and doc.findAllText then
-        local ok, res = pcall(function()
-            -- pattern, case_insensitive, nb_context_words, max_hits, regex.
-            -- High max_hits so a recurring marker's true region isn't truncated
-            -- away in document order before nearest-by-fraction can pick it.
-            return doc:findAllText(marker, false, 0, 1000, false)
+    if marker and new_ui.document.findText then
+        local ok, results = pcall(function()
+            -- origin -1 = from start; direction 0 = forward; up to 50 hits.
+            return new_ui.document:findText(marker, -1, 0, false, nil, false, 50)
         end)
-        if ok then results = res end
-    end
-
-    if type(results) ~= "table" or not results[1] then
-        if fallback_xp then pcall(function() new_ui.rolling:onGotoXPointer(fallback_xp) end) end
-        return
-    end
-
-    if #results == 1 then -- unambiguous
-        pcall(function() new_ui.rolling:onGotoXPointer(results[1].start) end)
-        return
-    end
-
-    -- Several matches: choose the one closest to where the reader was.
-    local best, best_d = nil, nil
-    if source_frac then
-        for _, r in ipairs(results) do
-            local f = xp_fraction(doc, r.start)
-            if f then
-                local d = math.abs(f - source_frac)
-                if not best_d or d < best_d then best, best_d = r, d end
-            end
+        if ok and type(results) == "table" and results[1] and results[1].start then
+            pcall(function() new_ui.rolling:onGotoXPointer(results[1].start) end)
+            if #results > 1 then self:showMatchChooser(new_ui, results) end
+            return
         end
     end
-    best = best or results[1]
-    pcall(function() new_ui.rolling:onGotoXPointer(best.start) end)
-
-    -- If we couldn't place it confidently, let the user pick the right page.
-    if (not source_frac) or (best_d and best_d > FURI_CONFIDENT_FRAC) then
-        self:showMatchChooser(new_ui, results, source_frac)
+    if fallback_xp then
+        pcall(function() new_ui.rolling:onGotoXPointer(fallback_xp) end)
     end
 end
 
--- Show all marker matches (nearest to the reader's position first); tap to jump.
-function Furigana:showMatchChooser(new_ui, results, source_frac)
+-- Show a list of all marker matches; tap one to jump to that page.
+function Furigana:showMatchChooser(new_ui, results)
     local KeyValuePage = require("ui/widget/keyvaluepage")
     local doc = new_ui.document
-
-    local rows = {}
-    for _, r in ipairs(results) do
-        rows[#rows + 1] = { r = r, page = doc:getPageFromXPointer(r.start) or 0,
-                            f = xp_fraction(doc, r.start) }
-    end
-    if source_frac then
-        table.sort(rows, function(a, b)
-            local da = a.f and math.abs(a.f - source_frac) or math.huge
-            local db = b.f and math.abs(b.f - source_frac) or math.huge
-            return da < db
-        end)
-    else
-        table.sort(rows, function(a, b) return a.page < b.page end)
-    end
-
     local kv = {}
-    for _, row in ipairs(rows) do
+    for _, r in ipairs(results) do
+        local page = doc:getPageFromXPointer(r.start) or "?"
         local snippet = ""
-        local ok, s = pcall(function() return doc:getTextFromXPointers(row.r.start, row.r["end"], false) end)
+        local ok, s = pcall(function() return doc:getTextFromXPointers(r.start, r["end"], false) end)
         if ok and s then snippet = s:gsub("[\r\n]+", " "):sub(1, 40) end
         kv[#kv + 1] = {
-            T(_("Page %1"), row.page),
+            T(_("Page %1"), page),
             snippet,
             callback = function()
-                pcall(function() new_ui.rolling:onGotoXPointer(row.r.start) end)
+                pcall(function() new_ui.rolling:onGotoXPointer(r.start) end)
             end,
         }
     end
     UIManager:show(KeyValuePage:new{
-        title = T(N_("Furigana: %1 possible position — tap to choose",
-                     "Furigana: %1 possible positions — tap to choose", #results), #results),
+        title = T(N_("Furigana found %1 match — tap to choose",
+                     "Furigana found %1 matches — tap to choose", #results), #results),
         kv_pairs = kv,
     })
 end
 
 -- Reopen `path` in place, restoring the current reading position.
 function Furigana:switchTo(path)
-    local saved_xp, marker, source_frac
+    local saved_xp, marker
     if self.ui and self.ui.rolling then
         saved_xp = self.ui.rolling:getBookLocation()
         marker = self:capturePageMarker()
-        source_frac = book_fraction(self.ui.document) -- measured in the source doc
     end
     self.ui:switchDocument(path, false, function(new_ui)
-        self:restorePosition(new_ui, marker, saved_xp, source_frac)
+        self:restorePosition(new_ui, marker, saved_xp)
     end)
 end
 

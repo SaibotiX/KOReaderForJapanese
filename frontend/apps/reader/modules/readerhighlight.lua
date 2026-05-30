@@ -2024,6 +2024,20 @@ function ReaderHighlight:lookupDictWord()
     end
 end
 
+-- Like :lookupDictWord, but restricts the lookup to the active dictionary
+-- collection (used by the double-tap gesture). Text-only; collection lookups on
+-- OCR-only documents fall back to nothing.
+function ReaderHighlight:lookupDictWordInCollection()
+    if not (self.selected_text and #self.selected_text.text > 0) then
+        return
+    end
+    local word_boxes = {}
+    for i, sbox in ipairs(self.selected_text.sboxes) do
+        word_boxes[i] = self.view:pageToScreenTransform(self.hold_pos.page, sbox)
+    end
+    self.ui.dictionary:lookupWordInCollection(self.selected_text.text, false, word_boxes, self, self.selected_link)
+end
+
 function ReaderHighlight:getSelectedWordContext(nb_words)
     if not self.selected_text then return end
     local ok, prev_context, next_context = pcall(self.ui.document.getSelectedWordContext, self.ui.document,
@@ -2165,6 +2179,49 @@ function ReaderHighlight:onHoldRelease()
             end
         end
     end
+    return true
+end
+
+-- Dispatcher action "Look up word in dictionary collection": looks up the word
+-- under the assigned gesture, restricted to the active dictionary collection.
+-- The normal long-press lookup (all dictionaries) is left untouched.
+-- Assign this to a positional gesture (e.g. double tap on a side) in the gesture
+-- manager; it is passed the gesture object (category="arg"), so it knows where
+-- you tapped.
+function ReaderHighlight:onLookupCollectionWord(ges)
+    -- Needs a gesture with a position to know which word to look up.
+    if type(ges) ~= "table" or not ges.pos then
+        return false
+    end
+    if not (self.ui.dictionary and self.ui.dictionary.getActiveCollectionMembers) then
+        return false
+    end
+    local members = self.ui.dictionary:getActiveCollectionMembers()
+    if not members then
+        UIManager:show(InfoMessage:new{
+            text = _("No dictionary collection is active.\nActivate one in: Dictionary settings → Dictionary collections."),
+            timeout = 2,
+        })
+        return true
+    end
+    if #members == 0 then
+        -- An active but empty collection means "look up nothing": don't fall back
+        -- to all dictionaries, just tell the user the collection has no members.
+        UIManager:show(InfoMessage:new{
+            text = _("The active dictionary collection is empty.\nAdd dictionaries to it in: Dictionary settings → Dictionary collections."),
+            timeout = 2,
+        })
+        return true
+    end
+    -- Reuse the long-press word selection (it also draws the highlight box).
+    local selected = self:onHold(nil, ges)
+    if not (selected and self.is_word_selection and self.selected_text) then
+        return false
+    end
+    -- This gesture has no matching hold_release, so cancel the long-hold timer
+    -- that onHold() scheduled, then trigger the collection-restricted lookup.
+    self:_resetHoldTimer(true)
+    self:lookupDictWordInCollection()
     return true
 end
 

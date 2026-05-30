@@ -133,6 +133,7 @@ local gestures_list = {
     double_tap_top_right_corner = _("Top right"),
     double_tap_bottom_left_corner = _("Bottom left"),
     double_tap_bottom_right_corner = _("Bottom right"),
+    double_tap_whole_screen = _("Whole screen"),
     two_finger_tap_top_left_corner = _("Top left"),
     two_finger_tap_top_right_corner = _("Top right"),
     two_finger_tap_bottom_left_corner = _("Bottom left"),
@@ -406,6 +407,31 @@ function Gestures:genSubItemTable(gestures)
     return sub_item_table
 end
 
+function Gestures:genDoubleTapSubItemTable()
+    local sub_item_table = {
+        {
+            text = _("Use whole screen for double tap"),
+            help_text = _("Register a single double-tap zone covering the whole screen instead of the separate left/right side and corner zones.\n\nTakes effect after restarting."),
+            checked_func = function()
+                return G_reader_settings:isTrue("gesture_double_tap_whole_screen")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("gesture_double_tap_whole_screen")
+                UIManager:askForRestart()
+            end,
+            separator = true,
+        },
+    }
+    if G_reader_settings:isTrue("gesture_double_tap_whole_screen") then
+        table.insert(sub_item_table, self:genSubItem("double_tap_whole_screen"))
+    else
+        for _, item in ipairs(section_items.double_tap) do
+            table.insert(sub_item_table, self:genSubItem(item))
+        end
+    end
+    return sub_item_table
+end
+
 function Gestures:genMultiswipeMenu(get_list)
     -- { multiswipe name, separator }
     local multiswipe_list = {
@@ -641,7 +667,11 @@ function Gestures:onShowGestureOverview()
     add_section("hold_corner")
     add_section("one_finger_swipe")
     if not self.is_docless and self.ui.disable_double_tap ~= true then
-        add_section("double_tap")
+        if G_reader_settings:isTrue("gesture_double_tap_whole_screen") then
+            add_section("double_tap", { "double_tap_whole_screen" })
+        else
+            add_section("double_tap")
+        end
     end
     if self.has_multitouch then
         add_section("two_finger_tap")
@@ -907,7 +937,9 @@ function Gestures:addToMainMenu(menu_items)
                 enabled_func = function()
                     return not self.is_docless and self.ui.disable_double_tap ~= true
                 end,
-                sub_item_table = self:genSubItemTable(section_items.double_tap),
+                sub_item_table_func = function()
+                    return self:genDoubleTapSubItemTable()
+                end,
             },
         },
     }
@@ -1094,6 +1126,21 @@ function Gestures:setupGesture(ges)
         }
     end
 
+    -- "Use whole screen for double tap" replaces the per-region double-tap zones
+    -- (left/right side, corners) with a single fullscreen zone. Registration runs
+    -- once at startup, so toggling the setting requires a restart.
+    local double_tap_whole_screen = G_reader_settings:isTrue("gesture_double_tap_whole_screen")
+    local is_double_tap_region = {
+        double_tap_left_side = true,
+        double_tap_right_side = true,
+        double_tap_top_left_corner = true,
+        double_tap_top_right_corner = true,
+        double_tap_bottom_left_corner = true,
+        double_tap_bottom_right_corner = true,
+    }
+    if double_tap_whole_screen and is_double_tap_region[ges] then return end
+    if not double_tap_whole_screen and ges == "double_tap_whole_screen" then return end
+
     if ges == "multiswipe" then
         ges_type = "multiswipe"
         zone = zone_fullscreen
@@ -1119,6 +1166,9 @@ function Gestures:setupGesture(ges)
         ges_type = "tap"
         zone = zone_bottom_left_corner
         overrides = overrides_tap_corner
+    elseif ges == "double_tap_whole_screen" then
+        ges_type = "double_tap"
+        zone = zone_fullscreen
     elseif ges == "double_tap_left_side" then
         ges_type = "double_tap"
         zone = zone_left
