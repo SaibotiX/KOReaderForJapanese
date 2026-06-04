@@ -18,20 +18,31 @@
 -- have to call sdcv each time) we batch as many candidates as possible
 -- together in order to reduce the impact we have on text selection.
 
+local Analysis = require("analysis")
+local Conjugator = require("conjugator")
 local Deinflector = require("deinflector")
+local Dispatcher = require("dispatcher")
+local InfoMessage = require("ui/widget/infomessage")
+local AnalysisViewer = require("analysisviewer")
+local LLM = require("llm")
 local LanguageSupport = require("languagesupport")
+local PosDict = require("posdict")
 local ReaderDictionary = require("apps/reader/modules/readerdictionary")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local json_min = require("json_min")
 local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
 local N_ = _.ngettext
 local T = require("ffi/util").template
 
-local SingleInstanceDeinflector = Deinflector:new{}
+local SingleInstanceDeinflector = Deinflector:new {}
 
-local Japanese = WidgetContainer:extend{
+-- The conjugator's rules + POS database are shared process-wide and loaded once.
+local conjugator_configured = false
+
+local Japanese = WidgetContainer:extend {
     name = "japanese",
     pretty_name = "Japanese",
 }
@@ -44,8 +55,14 @@ local DEFAULT_TEXT_SCAN_LENGTH = 20
 function Japanese:init()
     self.deinflector = SingleInstanceDeinflector
     self.dictionary = (self.ui and self.ui.dictionary) or ReaderDictionary:new()
-    self.max_scan_length = G_reader_settings:readSetting("language_japanese_text_scan_length") or DEFAULT_TEXT_SCAN_LENGTH
+    self.max_scan_length = G_reader_settings:readSetting("language_japanese_text_scan_length") or
+    DEFAULT_TEXT_SCAN_LENGTH
     LanguageSupport:registerPlugin(self)
+    -- Single tap on a word opens the analysis (default on; see onTapAnalyse).
+    self.tap_to_analyse = G_reader_settings:nilOrTrue("language_japanese_tap_to_analyse")
+    if self.ui and self.ui.dictionary and self.ui.dictionary.addToDictButtons then
+        self:registerDictButton()
+    end
 end
 
 function Japanese:supportsLanguage(language_code)
@@ -156,7 +173,8 @@ function Japanese:onWordSelection(args)
         -- last character requires a linear walk through the string anyway, and
         -- get_next_char_pos() skips over newlines.
         if not isPossibleJapaneseWord(current_text) then
-            logger.dbg("japanese.koplugin: stopping expansion at", current_text, "because in contains non-word characters")
+            logger.dbg("japanese.koplugin: stopping expansion at", current_text,
+                "because in contains non-word characters")
             break
         end
 
@@ -194,8 +212,527 @@ function Japanese:onWordSelection(args)
         end
     end
     if best_word ~= nil then
-        return {best_word.pos0, best_word.pos1}
+        return { best_word.pos0, best_word.pos1 }
     end
+end
+
+--- Lazily load the conjugation engine (Yomichan rules + POS SQLite) on first
+-- use, so opening a book is not slowed by parsing the rules and opening the
+-- ~34 MB database.  Returns whether the engine is ready.
+function Japanese:ensureEngine()
+    if conjugator_configured then return true end
+    local ok, err = pcall(function()
+        local rules = json_min.load_file(self.path .. "/yomichan-deinflect.json")
+        local posdict = PosDict.new(self.path .. "/jmdict_pos.sqlite")
+        Conjugator.configure(rules, posdict)
+    end)
+    if not ok then
+        logger.err("japanese.koplugin: conjugator init failed:", err)
+        return false
+    end
+    conjugator_configured = true
+    return true
+end
+
+--- The furigana plugin's tokenizer (lazy, cached), set to annotate every kanji
+-- so we get a full reading.  nil when the furigana plugin is unavailable.
+function Japanese:getFuriganaTokenizer()
+    if self._furigana_tried then return self._furigana_tok end
+    self._furigana_tried = true
+    if self.ui and self.ui.furigana and self.ui.furigana.getTokenizer then
+        local ok, tok = pcall(function()
+            local t = self.ui.furigana:getTokenizer()
+            if t.setMinGrade then t:setMinGrade(1) end -- annotate all kanji
+            return t
+        end)
+        if ok then self._furigana_tok = tok end
+    end
+    return self._furigana_tok
+end
+
+--- Annotate a word as "word (reading)" via the furigana plugin, when enabled and
+-- available; otherwise return the word unchanged.
+function Japanese:furiganaAnnotate(word)
+    if not word or word == "" then return word end
+    if not G_reader_settings:nilOrTrue("language_japanese_furigana") then return word end
+    if not util.hasCJKChar(word) then return word end
+    local tok = self:getFuriganaTokenizer()
+    if not tok then return word end
+    local ok, ruby = pcall(function() return tok:annotate(word) end)
+    if not ok or type(ruby) ~= "string" then return word end
+    return Analysis.furigana_label(word, ruby)
+end
+
+--- Look up English definitions for the dictionary form across the user's
+-- installed dictionaries (sdcv).  Returns a list of { dict, definition }.
+function Japanese:lookupDefinitions(base)
+    local defs = {}
+    if not (base and base ~= "" and self.dictionary and self.dictionary.rawSdcv) then
+        return defs
+    end
+    local ok, cancelled, all_results = pcall(self.dictionary.rawSdcv, self.dictionary, { base })
+    if not ok or cancelled or type(all_results) ~= "table" then
+        return defs
+    end
+    local entries = all_results[1]
+    if type(entries) ~= "table" then return defs end
+    for _, e in ipairs(entries) do
+        if type(e) == "table" and not e.no_result and e.definition then
+            defs[#defs + 1] = { dict = e.dict or "", definition = Analysis.strip_html(e.definition) }
+        end
+    end
+    self:recordKnownDicts(defs)
+    return defs
+end
+
+--- Remember dictionary names seen in lookups so they can be ordered in the
+-- page-order config even before re-querying.
+function Japanese:recordKnownDicts(defs)
+    local known = G_reader_settings:readSetting("language_japanese_known_dicts") or {}
+    local seen = {}
+    for _, n in ipairs(known) do seen[n] = true end
+    local changed = false
+    for _, e in ipairs(defs) do
+        if e.dict and e.dict ~= "" and not seen[e.dict] then
+            known[#known + 1] = e.dict
+            seen[e.dict] = true
+            changed = true
+        end
+    end
+    if changed then G_reader_settings:saveSetting("language_japanese_known_dicts", known) end
+end
+
+--- The on-device reorder UI (SortWidget) for the analysis page order: AI, Google
+-- Translate, and each known dictionary, moved up/down and saved.
+function Japanese:showPageOrderConfig()
+    local SortWidget = require("ui/widget/sortwidget")
+    local labels = {
+        [Analysis.AI_ID] = _("AI analysis"),
+        [Analysis.TRANSLATE_ID] = _("Google Translate"),
+    }
+    local items, seen = {}, {}
+    local function add(id)
+        if id == nil or id == "" or seen[id] then return end
+        seen[id] = true
+        items[#items + 1] = { text = labels[id] or id, id = id }
+    end
+    -- Saved order first (preserved), then AI / Translate, then known dictionaries.
+    for _, id in ipairs(G_reader_settings:readSetting("language_japanese_page_order") or {}) do add(id) end
+    add(Analysis.AI_ID)
+    add(Analysis.TRANSLATE_ID)
+    for _, n in ipairs(G_reader_settings:readSetting("language_japanese_known_dicts") or {}) do add(n) end
+    if self.ui and self.ui.dictionary and type(self.ui.dictionary.enabled_dict_names) == "table" then
+        for _, n in ipairs(self.ui.dictionary.enabled_dict_names) do add(n) end
+    end
+    UIManager:show(SortWidget:new {
+        title = _("Analysis page order"),
+        item_table = items,
+        callback = function()
+            local order = {}
+            for _, it in ipairs(items) do order[#order + 1] = it.id end
+            G_reader_settings:saveSetting("language_japanese_page_order", order)
+        end,
+    })
+end
+
+--- Present the analysis, optional AI section, and (browsable) dictionary
+-- definitions in one window.  With several dictionaries, the Prev/Next buttons,
+-- the volume/page keys and a horizontal swipe page through them (see
+-- AnalysisViewer); long content scrolls (vertical swipe / scroll bar).
+function Japanese:showAnalysisWindow(result, defs)
+    local title = result.surface
+    if result.base ~= "" and result.base ~= result.surface then
+        title = result.surface .. " → " .. result.base
+    end
+    local pages = Analysis.build_pages(result, defs,
+        G_reader_settings:readSetting("language_japanese_page_order"))
+    local total = #pages
+    local idx = 1
+    local viewer, change
+    local function render()
+        local buttons
+        if total > 1 then
+            buttons = { {
+                { text = "◂ " .. _("Prev"), callback = function() change(-1) end },
+                { text = _("Next") .. " ▸", callback = function() change(1) end },
+            } }
+        end
+        viewer = AnalysisViewer:new {
+            title = title,
+            text = Analysis.window_text(result, pages[idx], idx, total),
+            buttons_table = buttons,
+            add_default_buttons = true,
+            nav_enabled = total > 1,
+            on_change_page = function(delta) change(delta) end,
+        }
+        UIManager:show(viewer)
+    end
+    change = function(delta)
+        idx = (idx - 1 + delta) % total + 1
+        UIManager:close(viewer)
+        render()
+    end
+    render()
+end
+
+--- Analyse `text` and present the result (dictionary form, part of speech,
+-- conjugation path, optional AI grammar analysis, and dictionary translations).
+-- Any failure is surfaced rather than silently doing nothing.
+function Japanese:showAnalysis(text)
+    if not text or text == "" then return end
+    text = util.cleanupSelectedText(text)
+    if not util.hasCJKChar(text) then return end
+    if not self:ensureEngine() then
+        UIManager:show(InfoMessage:new { text = _("Japanese conjugation engine could not be loaded.") })
+        return
+    end
+    local function run()
+        local result, defs
+        local ok, err = pcall(function()
+            result = Analysis.analyse(text, self.deinflector)
+            defs = self:lookupDefinitions(result.base)
+        end)
+        if not ok then
+            logger.err("japanese.koplugin: analysis failed:", err)
+            UIManager:show(InfoMessage:new { text = T(_("Japanese analysis failed: %1"), tostring(err)) })
+            return
+        end
+        result.surface_display = self:furiganaAnnotate(result.surface)
+        result.base_display = self:furiganaAnnotate(result.base)
+        local tr_text, tr_err = self:queryTranslate(result.base, result.surface)
+        result.translate = tr_text or (tr_err and T(_("(translation failed: %1)"), tr_err))
+        local ai_text, ai_err = self:queryAI(result.surface)
+        result.ai = ai_text or (ai_err and T(_("(AI request failed: %1)"), ai_err))
+        self:showAnalysisWindow(result, defs)
+    end
+    -- Online lookups (translate / AI) need a Trapper coroutine for the
+    -- dismissable subprocess; without them, run directly.
+    if self:aiEnabled() or self:translateEnabled() then
+        require("ui/trapper"):wrap(run)
+    else
+        run()
+    end
+end
+
+--- Whether the optional AI grammar analysis is enabled and fully configured.
+function Japanese:aiEnabled()
+    return G_reader_settings:isTrue("language_japanese_ai_enabled")
+        and LLM.is_configured(self:aiOpts())
+end
+
+function Japanese:aiOpts()
+    return {
+        provider = G_reader_settings:readSetting("language_japanese_ai_provider") or "openai",
+        endpoint = G_reader_settings:readSetting("language_japanese_ai_endpoint") or "",
+        api_key = G_reader_settings:readSetting("language_japanese_ai_key") or "",
+        model = G_reader_settings:readSetting("language_japanese_ai_model") or "",
+    }
+end
+
+--- Query the configured LLM for the surface form — only when online.  Runs in a
+-- dismissable subprocess so the UI never freezes.  Returns the text or nil.
+function Japanese:queryAI(surface)
+    if not self:aiEnabled() then return nil end
+    if not require("ui/network/manager"):isConnected() then return nil end
+    local Trapper = require("ui/trapper")
+    local opts = self:aiOpts()
+    local completed, ok_flag, payload = Trapper:dismissableRunInSubprocess(function()
+        local text, err = LLM.query(opts, surface)
+        if text and text ~= "" then return true, text end
+        return false, tostring(err or "no response")
+    end, _("Querying AI…"))
+    if not completed then return nil end          -- dismissed by the user
+    if ok_flag then return LLM.strip_na(payload) end -- success → AI text (n/a lines dropped)
+    return nil, payload                            -- failure → error message (shown)
+end
+
+--- Test the AI configuration: send a sample word and show the raw response or
+-- the exact error (e.g. Gemini's "model not found" 404), to help debugging.
+function Japanese:testAiConnection()
+    if not LLM.is_configured(self:aiOpts()) then
+        UIManager:show(InfoMessage:new { text = _("Configure the AI provider and API key (and endpoint/model) first.") })
+        return
+    end
+    if not require("ui/network/manager"):isConnected() then
+        UIManager:show(InfoMessage:new { text = _("Not online — connect to Wi-Fi to test the AI.") })
+        return
+    end
+    local opts = self:aiOpts()
+    require("ui/trapper"):wrap(function()
+        local Trapper = require("ui/trapper")
+        local completed, ok_flag, payload = Trapper:dismissableRunInSubprocess(function()
+            local text, err = LLM.query(opts, "食べる")
+            if text and text ~= "" then return true, text end
+            return false, tostring(err or "no response")
+        end, _("Testing AI connection…"))
+        if not completed then return end
+        UIManager:show(InfoMessage:new {
+            text = ok_flag and (_("AI OK. Sample response:\n\n") .. payload:sub(1, 600))
+                or (_("AI request failed:\n\n") .. payload),
+        })
+    end)
+end
+
+--- Whether the optional Google translation section is enabled.
+function Japanese:translateEnabled()
+    return G_reader_settings:isTrue("language_japanese_translate_enabled")
+end
+
+--- Google-translate the base and tapped forms (online) in a dismissable
+-- subprocess.  Returns a "form → translation" block (base, plus the surface form
+-- when it differs) or nil.
+function Japanese:queryTranslate(base, surface)
+    if not self:translateEnabled() then return nil end
+    if not require("ui/network/manager"):isConnected() then return nil end
+    local Trapper = require("ui/trapper")
+    local completed, base_tr, surf_tr = Trapper:dismissableRunInSubprocess(function()
+        local Translator = require("ui/translator")
+        local bt = Translator:translate(base, "en", "ja") or ""
+        local st = (surface ~= base) and (Translator:translate(surface, "en", "ja") or "") or ""
+        return bt, st
+    end, _("Translating…"))
+    if not completed then return nil end
+    local lines = {}
+    if type(base_tr) == "string" and base_tr ~= "" then
+        lines[#lines + 1] = base .. " → " .. base_tr
+    end
+    if type(surf_tr) == "string" and surf_tr ~= "" and surface ~= base then
+        lines[#lines + 1] = surface .. " → " .. surf_tr
+    end
+    if #lines == 0 then return nil, _("no translation returned") end
+    return table.concat(lines, "\n")
+end
+
+--- Gesture-bound entry point.  Registered as a `category="arg"` action, so when
+-- bound to a tap/gesture it receives the gesture object (with `.pos`) and we
+-- analyse the word under it; otherwise we fall back to the current selection.
+function Japanese:onShowJapaneseAnalysis(ges)
+    if type(ges) == "table" and ges.pos and self:analyseAtPos(ges.pos) then
+        return true
+    end
+    local selected = self.ui and self.ui.highlight and self.ui.highlight.selected_text
+    if selected and selected.text and selected.text ~= "" then
+        self:showAnalysis(selected.text)
+    else
+        UIManager:show(InfoMessage:new { text = _("Tap on a Japanese word to analyse it.") })
+    end
+    return true
+end
+
+--- Register the gesture-bindable "Analyse Japanese word" action.  category="arg"
+-- means a bound gesture's object (carrying the tap position) is passed through,
+-- so it works as a tap-on-word lookup from the Gestures menu (like "Follow
+-- nearest link").
+function Japanese:onDispatcherRegisterActions()
+    Dispatcher:registerAction("japanese_analyze_word", {
+        category = "arg",
+        event = "ShowJapaneseAnalysis",
+        arg = { pos = { x = 0, y = 0 } },
+        title = _("Analyse Japanese word"),
+        reader = true,
+    })
+end
+
+--- Register the single-tap touch zone once the reader (view/document) is ready.
+function Japanese:onReaderReady()
+    self:setupAnalyseTouchZone()
+end
+
+--- A high-priority "tap" zone: it analyses the word under the tap and otherwise
+-- declines (returns false), letting the tap fall through to the normal
+-- page-turn / highlight handling.
+function Japanese:setupAnalyseTouchZone()
+    if self._tap_zone_registered then return end
+    if not (self.ui and self.ui.registerTouchZones) then return end
+    self.ui:registerTouchZones({
+        {
+            id = "japanese_analyse_tap",
+            ges = "tap",
+            screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 },
+            overrides = {
+                "readerhighlight_tap",
+                "tap_top_left_corner", "tap_top_right_corner",
+                "tap_left_bottom_corner", "tap_right_bottom_corner",
+                "tap_forward", "tap_backward",
+            },
+            handler = function(ges) return self:onTapAnalyse(ges) end,
+        },
+    })
+    self._tap_zone_registered = true
+    logger.info("japanese.koplugin: registered whole-screen single-tap analysis zone")
+end
+
+--- Analyse the Japanese word at a screen position (from a tap or a bound
+-- gesture).  Returns true if a Japanese word was found and the window shown.
+-- No selection is painted (getWordFromPosition with do_not_draw_selection=true).
+function Japanese:analyseAtPos(screen_pos)
+    if not (screen_pos and self.ui.document and self.ui.view) then return false end
+    if self.ui.paging then return false end -- crengine/EPUB only
+    -- Copy the point: screenToPageTransform mutates it (adds .page).
+    local pos = self.ui.view:screenToPageTransform({ x = screen_pos.x, y = screen_pos.y })
+    local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, pos, true)
+    if not (ok and word and word.word and word.word ~= "") then return false end
+    if not util.hasCJKChar(word.word) then return false end
+    self:showAnalysis(self:expandWord(word))
+    return true
+end
+
+--- Whole-screen single-tap handler.  Returns false (so the tap still turns the
+-- page) when the feature is off or no Japanese word is under the tap.
+function Japanese:onTapAnalyse(ges)
+    if not self.tap_to_analyse then return false end
+    return self:analyseAtPos(ges and ges.pos) or false
+end
+
+--- Expand a tapped word to the full Japanese token, reusing onWordSelection's
+-- dictionary-validated forward scan but with non-drawing callbacks (so no
+-- selection is painted).  Falls back to the raw tapped word.
+function Japanese:expandWord(word)
+    if not (word.pos0 and word.pos1 and self.ui.document) then return word.word end
+    local doc = self.ui.document
+    local callbacks = {
+        get_prev_char_pos = function(p) return doc:getPrevVisibleChar(p) end,
+        get_next_char_pos = function(p) return doc:getNextVisibleChar(p) end,
+        get_text_in_range = function(a, b) return doc:getTextFromXPointers(a, b) end,
+    }
+    local ok, range = pcall(self.onWordSelection, self, {
+        text = word.word, pos0 = word.pos0, pos1 = word.pos1, callbacks = callbacks,
+    })
+    if ok and type(range) == "table" and range[1] and range[2] then
+        local ok2, expanded = pcall(function() return doc:getTextFromXPointers(range[1], range[2]) end)
+        if ok2 and expanded and expanded ~= "" then
+            return util.cleanupSelectedText(expanded)
+        end
+    end
+    return word.word
+end
+
+--- Add an "Analyse (JA)" button to the dictionary lookup popup, so the whole
+-- analysis (dictionary form, type, conjugation, dictionary entry, translation,
+-- AI) is available from a normal lookup too.  Shown only for CJK words.
+function Japanese:registerDictButton()
+    self.ui.dictionary:addToDictButtons({
+        id = "japanese_analyse",
+        text = _("Analyse (JA)"),
+        show_func = function(dict_popup)
+            local w = dict_popup.lookupword or dict_popup.word
+            return w ~= nil and util.hasCJKChar(w)
+        end,
+        callback = function(dict_popup)
+            self:showAnalysis(dict_popup.lookupword or dict_popup.word)
+        end,
+    })
+end
+
+--- Prompt for a text setting via an input dialog, then refresh the menu.
+function Japanese:promptText(title, setting_key, touchmenu_instance, is_password)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new {
+        title = title,
+        input = G_reader_settings:readSetting(setting_key) or "",
+        text_type = is_password and "password" or nil,
+        buttons = { {
+            { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+            {
+                text = _("Save"),
+                is_enter_default = true,
+                callback = function()
+                    G_reader_settings:saveSetting(setting_key, dialog:getInputText())
+                    UIManager:close(dialog)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            },
+        } },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+--- The "AI grammar analysis" submenu (enable + provider + endpoint/key/model).
+function Japanese:genAiMenu()
+    local function provider()
+        return G_reader_settings:readSetting("language_japanese_ai_provider") or "openai"
+    end
+    local function set_provider(name)
+        G_reader_settings:saveSetting("language_japanese_ai_provider", name)
+        G_reader_settings:delSetting("language_japanese_ai_model") -- use the new provider's default
+    end
+    return {
+        text = _("AI grammar analysis (online)"),
+        help_text = _("When enabled and online, query an OpenAI-compatible or Google Gemini LLM for a grammar breakdown, shown between Conjugation and the dictionary entry. Needs an API key (Gemini's free tier works); hidden when offline or unconfigured."),
+        sub_item_table = {
+            {
+                text = _("Enable AI analysis"),
+                checked_func = function() return G_reader_settings:isTrue("language_japanese_ai_enabled") end,
+                callback = function(touchmenu_instance)
+                    local on = G_reader_settings:isTrue("language_japanese_ai_enabled")
+                    G_reader_settings:saveSetting("language_japanese_ai_enabled", not on)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            },
+            {
+                text_func = function()
+                    return T(_("Provider: %1"), provider() == "gemini"
+                        and _("Google Gemini") or _("OpenAI-compatible"))
+                end,
+                sub_item_table = {
+                    {
+                        text = _("OpenAI-compatible"),
+                        radio = true,
+                        checked_func = function() return provider() ~= "gemini" end,
+                        callback = function() set_provider("openai") end,
+                    },
+                    {
+                        text = _("Google Gemini (free tier)"),
+                        radio = true,
+                        checked_func = function() return provider() == "gemini" end,
+                        callback = function() set_provider("gemini") end,
+                    },
+                },
+            },
+            {
+                text_func = function()
+                    if provider() == "gemini" then return _("Endpoint: automatic for Gemini") end
+                    local v = G_reader_settings:readSetting("language_japanese_ai_endpoint")
+                    return T(_("Endpoint: %1"), (v and v ~= "") and v or _("(not set)"))
+                end,
+                enabled_func = function() return provider() ~= "gemini" end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:promptText(_("API endpoint (chat-completions URL)"),
+                        "language_japanese_ai_endpoint", touchmenu_instance)
+                end,
+            },
+            {
+                text_func = function()
+                    local v = G_reader_settings:readSetting("language_japanese_ai_key")
+                    return T(_("API key: %1"), (v and v ~= "") and "••••••" or _("(not set)"))
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:promptText(_("API key"), "language_japanese_ai_key", touchmenu_instance, true)
+                end,
+            },
+            {
+                text_func = function()
+                    local v = G_reader_settings:readSetting("language_japanese_ai_model")
+                    local default = provider() == "gemini" and "gemini-2.0-flash" or "gpt-4o-mini"
+                    return T(_("Model: %1"), (v and v ~= "") and v or default)
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:promptText(_("Model name"), "language_japanese_ai_model", touchmenu_instance)
+                end,
+            },
+            {
+                text = _("Test connection"),
+                keep_menu_open = true,
+                help_text = _("Send a sample word to the configured AI and show the response or the exact error."),
+                callback = function() self:testAiConnection() end,
+            },
+        },
+    }
 end
 
 function Japanese:genMenuItem()
@@ -203,14 +740,16 @@ function Japanese:genMenuItem()
         -- self.max_scan_length configuration
         {
             text_func = function()
-                return T(N_("Text scan length: %1 character", "Text scan length: %1 characters", self.max_scan_length), self.max_scan_length)
+                return T(N_("Text scan length: %1 character", "Text scan length: %1 characters", self.max_scan_length),
+                    self.max_scan_length)
             end,
-            help_text = _("Number of characters to look ahead when trying to expand tap-and-hold word selection in documents."),
+            help_text = _(
+            "Number of characters to look ahead when trying to expand tap-and-hold word selection in documents."),
             keep_menu_open = true,
             callback = function(touchmenu_instance)
                 local SpinWidget = require("ui/widget/spinwidget")
                 local Screen = require("device").screen
-                local items = SpinWidget:new{
+                local items = SpinWidget:new {
                     title_text = _("Text scan length"),
                     info_text = T(_([[
 The maximum number of characters to look ahead when trying to expand tap-and-hold word selection in documents.
@@ -237,6 +776,56 @@ Default value: %1]]), DEFAULT_TEXT_SCAN_LENGTH),
     }
     -- self.deinflector configuration
     util.arrayAppend(sub_item_table, self.deinflector:genMenuItems())
+
+    -- Word analysis: the single-tap toggle and how to invoke it.
+    table.insert(sub_item_table, {
+        text = _("Tap a word to analyse it"),
+        checked_func = function() return self.tap_to_analyse end,
+        help_text = _([[
+When enabled, a single tap on a Japanese word shows its dictionary form, part of speech, how it is conjugated, and its English translation from your installed dictionaries. Tapping a margin or blank area still turns the page.
+
+You can also bind “Analyse Japanese word” to a gesture under Gestures.]]),
+        callback = function(touchmenu_instance)
+            self.tap_to_analyse = not self.tap_to_analyse
+            G_reader_settings:saveSetting("language_japanese_tap_to_analyse", self.tap_to_analyse)
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    })
+
+    -- Furigana on the Word / Dictionary form header fields (via furigana plugin).
+    table.insert(sub_item_table, {
+        text = _("Furigana on Word & Dictionary form"),
+        checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_furigana") end,
+        help_text = _("Show the reading in brackets after the Word and Dictionary form, e.g. 食べる (たべる). Uses the Furigana plugin's dictionary (first use loads it, which takes a moment); has no effect if that plugin is unavailable."),
+        callback = function(touchmenu_instance)
+            local on = G_reader_settings:nilOrTrue("language_japanese_furigana")
+            G_reader_settings:saveSetting("language_japanese_furigana", not on)
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    })
+
+    -- Optional Google translation of the base + conjugated form (online).
+    table.insert(sub_item_table, {
+        text = _("Google Translate: base + conjugated form (online)"),
+        checked_func = function() return G_reader_settings:isTrue("language_japanese_translate_enabled") end,
+        help_text = _("Standalone toggle (not the AI). When enabled and online, show Google translations of both the dictionary form and the form you tapped, between Conjugation and the dictionary entry. Tick to enable, untick to disable."),
+        callback = function(touchmenu_instance)
+            local on = G_reader_settings:isTrue("language_japanese_translate_enabled")
+            G_reader_settings:saveSetting("language_japanese_translate_enabled", not on)
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    })
+
+    -- Order of the analysis pages (AI / Google Translate / dictionaries).
+    table.insert(sub_item_table, {
+        text = _("Analysis page order"),
+        keep_menu_open = true,
+        help_text = _("Set the order of the analysis pages: AI, Google Translate, and each dictionary (move up/down). Dictionaries appear here once seen in a lookup."),
+        callback = function() self:showPageOrderConfig() end,
+    })
+
+    -- Optional AI grammar analysis (online; OpenAI-compatible or Google Gemini).
+    table.insert(sub_item_table, self:genAiMenu())
 
     return {
         text = _("Japanese"),

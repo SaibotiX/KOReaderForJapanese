@@ -237,6 +237,129 @@ local function clip_to_first_block(html)
     return html
 end
 
+-- crengine's text search only ever matches WITHIN a single text node (it walks
+-- node by node, searching each node's text in isolation). The annotated copy
+-- wraps every annotated word's base in its own <ruby> node, so a page's base
+-- text is split across many tiny nodes there and a multi-word marker can never
+-- match. The helpers below find runs of text that annotation leaves contiguous,
+-- so we still have something searchable in the annotated copy.
+
+-- A codepoint that annotation isolates into its own <ruby> base text node:
+-- kanji, the 々 iteration mark, or a full-width digit (which gets a number
+-- reading). A search anchor must not span any of these. Everything else (kana,
+-- latin, punctuation…) is emitted as plain, contiguous text.
+local function cp_in_ruby_base(cp)
+    return (cp >= 0x4E00 and cp <= 0x9FFF)   -- CJK Unified Ideographs
+        or (cp >= 0x3400 and cp <= 0x4DBF)   -- CJK Extension A
+        or (cp >= 0xF900 and cp <= 0xFAFF)   -- CJK Compatibility Ideographs
+        or cp == 0x3005                      -- 々 (kanji iteration mark)
+        or (cp >= 0xFF10 and cp <= 0xFF19)   -- full-width digits ０-９
+end
+
+-- "Wordish" = a kana or Latin letter; used to keep anchors distinctive rather
+-- than runs of bare punctuation/whitespace.
+local function cp_is_wordish(cp)
+    return (cp >= 0x3040 and cp <= 0x30FF)   -- hiragana + katakana
+        or (cp >= 0xFF66 and cp <= 0xFF9F)   -- half-width katakana
+        or (cp >= 0x41 and cp <= 0x5A) or (cp >= 0x61 and cp <= 0x7A) -- A-Z a-z
+end
+
+-- Split clean base text into the maximal runs that annotation keeps as a single
+-- contiguous text node (runs free of any ruby-base codepoint). Each such run is
+-- a candidate "anchor" that crengine can still find in the annotated copy.
+-- Returns { { s = text, cps = codepoint_count, off = start_codepoint_index } },
+-- keeping only reasonably distinctive runs (>= 4 chars, >= 2 wordish).
+local function safe_anchors(s)
+    local runs = {}
+    local i, len, cp_idx = 1, #s, 0
+    local start_byte, start_cp, run_cps, run_word = nil, 0, 0, 0
+    local function close(byte_end)
+        if start_byte and run_cps >= 4 and run_word >= 2 then
+            local text = (s:sub(start_byte, byte_end):gsub("^%s+", ""):gsub("%s+$", ""))
+            if #text > 0 then
+                runs[#runs + 1] = { s = text, cps = run_cps, off = start_cp }
+            end
+        end
+        start_byte, run_cps, run_word = nil, 0, 0
+    end
+    while i <= len do
+        local b = s:byte(i)
+        local cp, size
+        if b < 0x80 then cp, size = b, 1
+        elseif b < 0xE0 then cp, size = (b % 0x20) * 0x40 + ((s:byte(i + 1) or 0) % 0x40), 2
+        elseif b < 0xF0 then cp, size = (b % 0x10) * 0x1000
+            + ((s:byte(i + 1) or 0) % 0x40) * 0x40 + ((s:byte(i + 2) or 0) % 0x40), 3
+        else cp, size = -1, 4 end
+        if cp < 0 or cp_in_ruby_base(cp) then
+            close(i - 1)
+        else
+            if not start_byte then start_byte, start_cp = i, cp_idx end
+            run_cps = run_cps + 1
+            if cp_is_wordish(cp) then run_word = run_word + 1 end
+        end
+        i = i + size
+        cp_idx = cp_idx + 1
+    end
+    close(len)
+    return runs
+end
+
+-- Anchor-search tuning (the fallback used when the whole-page marker can't match
+-- because the target's base text is broken up by <ruby>). Only consider runs
+-- starting within this many characters of the page top (so the match lands on
+-- the right page); a run of at least this many characters is "distinctive"
+-- enough to rarely recur; try at most this many anchors; and cap hits per anchor
+-- (matching KOReader's own findall cap — each hit costs a selection-geometry
+-- pass, and a distinctive anchor rarely recurs that many times anyway).
+local ANCHOR_WINDOW_CP = 120
+local ANCHOR_GOOD_CP = 6
+local ANCHOR_MAX_TRY = 4
+local ANCHOR_MAX_HITS = 5000
+
+-- Anchors worth trying: distinctive runs (>= ANCHOR_GOOD_CP chars) first so
+-- recurrences stay rare, and within each group the earliest (nearest the page
+-- top) first so the restored position stays on the right page.
+local function ordered_anchors(marker)
+    local runs = safe_anchors(marker or "")
+    local near = {}
+    for _, r in ipairs(runs) do
+        if r.off <= ANCHOR_WINDOW_CP then near[#near + 1] = r end
+    end
+    if #near == 0 then near = runs end -- page top is all kanji; use what we have
+    table.sort(near, function(a, b)
+        local ga, gb = a.cps >= ANCHOR_GOOD_CP, b.cps >= ANCHOR_GOOD_CP
+        if ga ~= gb then return ga end -- distinctive runs first,
+        return a.off < b.off           -- then earliest (nearest the page top)
+    end)
+    return near
+end
+
+-- Reading position as a 0..1 fraction of the book. Page counts differ between
+-- the original and an annotated copy (and between levels), but the fraction is
+-- approximately preserved because ruby is added throughout — close enough to
+-- pick, among several text matches, the one nearest where the reader actually is.
+local function book_fraction(doc)
+    if not doc then return nil end
+    local ok, frac = pcall(function()
+        local total = doc:getPageCount()
+        local cur = doc:getCurrentPage()
+        if total and total > 0 and cur then return cur / total end
+        return nil
+    end)
+    return ok and frac or nil
+end
+
+-- Fraction of the book at which an xpointer sits, in the given document.
+local function xp_fraction(doc, xp)
+    local ok, frac = pcall(function()
+        local total = doc:getPageCount()
+        local pg = doc:getPageFromXPointer(xp)
+        if total and total > 0 and pg then return pg / total end
+        return nil
+    end)
+    return ok and frac or nil
+end
+
 -- Capture a marker of clean base text starting at the current top-of-page,
 -- regardless of whether the source is plain or already annotated. Uses
 -- getHTMLFromXPointers + clip-to-block + strip_ruby + tag-strip so any
@@ -250,7 +373,10 @@ function Furigana:capturePageMarker()
         local top_xp = self.ui.rolling:getBookLocation()
         if not top_xp then return nil end
         local end_xp = top_xp
-        for _ = 1, 200 do -- larger window than needed; strip_ruby may shrink it
+        -- Grab a generous window. On an annotated source, getNextVisibleChar
+        -- counts the ruby <rt> reading characters too, so this shrinks after
+        -- strip_ruby; clip_to_first_block also caps it at the paragraph end.
+        for _ = 1, 400 do
             local nxt = doc:getNextVisibleChar(end_xp)
             if not nxt or nxt == end_xp then break end
             end_xp = nxt
@@ -277,61 +403,146 @@ function Furigana:capturePageMarker()
     return nil
 end
 
--- Find the marker text in the new document and jump there. With a single hit
--- the jump is silent; with several, we still jump to the earliest match (the
--- usual right answer) but also show a chooser so the user can pick another.
-function Furigana:restorePosition(new_ui, marker, fallback_xp)
-    if not (new_ui and new_ui.rolling and new_ui.document) then return end
-    if marker and new_ui.document.findText then
-        local ok, results = pcall(function()
-            -- origin -1 = from start; direction 0 = forward; up to 50 hits.
-            return new_ui.document:findText(marker, -1, 0, false, nil, false, 50)
-        end)
-        if ok and type(results) == "table" and results[1] and results[1].start then
-            pcall(function() new_ui.rolling:onGotoXPointer(results[1].start) end)
-            if #results > 1 then self:showMatchChooser(new_ui, results) end
-            return
+-- How far (in book fraction) the best match may sit from the reader's position
+-- before we treat the jump as low-confidence and offer a manual chooser. Ruby
+-- drift between copies is typically < 5%; a chapters-apart mismatch is >> 10%.
+local FURI_CONFIDENT_FRAC = 0.10
+
+-- Among several marker/anchor matches, return the one whose position (as a book
+-- fraction) is closest to where the reader was, plus that distance. This is what
+-- avoids jumps to page 1 / an earlier chapter when the searched text recurs.
+-- Without a source fraction we can't compare, so fall back to document order.
+function Furigana:pickNearestMatch(doc, results, source_frac)
+    if not source_frac then return results[1], nil end
+    local best, best_d
+    for _, r in ipairs(results) do
+        local f = xp_fraction(doc, r.start)
+        if f then
+            local d = math.abs(f - source_frac)
+            if not best_d or d < best_d then best, best_d = r, d end
         end
     end
-    if fallback_xp then
-        pcall(function() new_ui.rolling:onGotoXPointer(fallback_xp) end)
+    return best or results[1], best_d
+end
+
+-- Find the reader's previous position in the new document and jump there.
+--
+-- Because crengine search only matches within a single text node, and the
+-- annotated copy splits each annotated word into its own <ruby> base node, the
+-- whole-page marker can be found when the target keeps that text contiguous
+-- (typically annotated -> original) but NOT in the annotated copy. So we:
+--   1. try the whole marker (exact: it pins the page top), and failing that,
+--   2. search for the most distinctive contiguous run of search-safe text near
+--      the page top (an "anchor"), which annotation leaves intact.
+-- In both cases, when the text recurs we pick the occurrence nearest the
+-- reader's previous position, and offer a manual chooser when unsure.
+function Furigana:restorePosition(new_ui, marker, fallback_xp, source_frac)
+    if not (new_ui and new_ui.rolling and new_ui.document) then return end
+    local doc = new_ui.document
+
+    local function search(pattern, max_hits)
+        if not (pattern and doc.findAllText) then return nil end
+        -- pattern, case_insensitive, nb_context_words, max_hits, regex
+        local ok, res = pcall(function()
+            return doc:findAllText(pattern, false, 0, max_hits, false)
+        end)
+        if ok and type(res) == "table" and res[1] then return res end
+        return nil
+    end
+
+    local best, best_d, best_results
+
+    -- 1) Whole-page marker (exact when the target keeps the base text contiguous).
+    local results = search(marker, 1000)
+    if results then
+        best, best_d = self:pickNearestMatch(doc, results, source_frac)
+        best_results = results
+    else
+        -- 2) Annotated target: match a contiguous safe-text anchor near the top,
+        --    trying the most distinctive ones until one lands confidently.
+        local tried = 0
+        for _, a in ipairs(ordered_anchors(marker)) do
+            local res = search(a.s, ANCHOR_MAX_HITS)
+            if res then
+                local b, d = self:pickNearestMatch(doc, res, source_frac)
+                d = d or math.huge
+                if b and (best == nil or d < best_d) then
+                    best, best_d, best_results = b, d, res
+                end
+                if best_d and best_d <= FURI_CONFIDENT_FRAC then break end
+            end
+            tried = tried + 1
+            if tried >= ANCHOR_MAX_TRY then break end
+        end
+    end
+
+    if not best then
+        if fallback_xp then pcall(function() new_ui.rolling:onGotoXPointer(fallback_xp) end) end
+        return
+    end
+
+    pcall(function() new_ui.rolling:onGotoXPointer(best.start) end)
+
+    -- A single match in the whole book is unambiguous; otherwise offer the
+    -- chooser unless we placed the jump confidently by reading position.
+    local single = best_results and #best_results == 1
+    local confident = source_frac and best_d and best_d ~= math.huge
+        and best_d <= FURI_CONFIDENT_FRAC
+    if not single and not confident then
+        self:showMatchChooser(new_ui, best_results, source_frac)
     end
 end
 
--- Show a list of all marker matches; tap one to jump to that page.
-function Furigana:showMatchChooser(new_ui, results)
+-- Show all marker matches (nearest to the reader's position first); tap to jump.
+function Furigana:showMatchChooser(new_ui, results, source_frac)
     local KeyValuePage = require("ui/widget/keyvaluepage")
     local doc = new_ui.document
-    local kv = {}
+
+    local rows = {}
     for _, r in ipairs(results) do
-        local page = doc:getPageFromXPointer(r.start) or "?"
+        rows[#rows + 1] = { r = r, page = doc:getPageFromXPointer(r.start) or 0,
+                            f = xp_fraction(doc, r.start) }
+    end
+    if source_frac then
+        table.sort(rows, function(a, b)
+            local da = a.f and math.abs(a.f - source_frac) or math.huge
+            local db = b.f and math.abs(b.f - source_frac) or math.huge
+            return da < db
+        end)
+    else
+        table.sort(rows, function(a, b) return a.page < b.page end)
+    end
+
+    local kv = {}
+    for _, row in ipairs(rows) do
         local snippet = ""
-        local ok, s = pcall(function() return doc:getTextFromXPointers(r.start, r["end"], false) end)
+        local ok, s = pcall(function() return doc:getTextFromXPointers(row.r.start, row.r["end"], false) end)
         if ok and s then snippet = s:gsub("[\r\n]+", " "):sub(1, 40) end
         kv[#kv + 1] = {
-            T(_("Page %1"), page),
+            T(_("Page %1"), row.page),
             snippet,
             callback = function()
-                pcall(function() new_ui.rolling:onGotoXPointer(r.start) end)
+                pcall(function() new_ui.rolling:onGotoXPointer(row.r.start) end)
             end,
         }
     end
     UIManager:show(KeyValuePage:new{
-        title = T(N_("Furigana found %1 match — tap to choose",
-                     "Furigana found %1 matches — tap to choose", #results), #results),
+        title = T(N_("Furigana: %1 possible position — tap to choose",
+                     "Furigana: %1 possible positions — tap to choose", #results), #results),
         kv_pairs = kv,
     })
 end
 
 -- Reopen `path` in place, restoring the current reading position.
 function Furigana:switchTo(path)
-    local saved_xp, marker
+    local saved_xp, marker, source_frac
     if self.ui and self.ui.rolling then
         saved_xp = self.ui.rolling:getBookLocation()
         marker = self:capturePageMarker()
+        source_frac = book_fraction(self.ui.document) -- measured in the source doc
     end
     self.ui:switchDocument(path, false, function(new_ui)
-        self:restorePosition(new_ui, marker, saved_xp)
+        self:restorePosition(new_ui, marker, saved_xp, source_frac)
     end)
 end
 
