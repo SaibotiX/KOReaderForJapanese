@@ -350,17 +350,31 @@ function Japanese:showAnalysisWindow(result, defs)
     local idx = 1
     local viewer, change
     local function render()
-        local buttons
+        local buttons = {}
         if total > 1 then
-            buttons = { {
+            table.insert(buttons, {
                 { text = "◂ " .. _("Prev"), callback = function() change(-1) end },
                 { text = _("Next") .. " ▸", callback = function() change(1) end },
-            } }
+            })
+        end
+        if self.ui and self.ui.dictionary then
+            -- Bridge to the main dictionary window (with its own collection and
+            -- analysis buttons), so the analysis window is never a dead end.
+            table.insert(buttons, {
+                {
+                    text = _("Look up in dictionary"),
+                    callback = function()
+                        UIManager:close(viewer)
+                        local lookup_word = result.base ~= "" and result.base or result.surface
+                        self.ui.dictionary:onLookupWord(lookup_word, true)
+                    end,
+                },
+            })
         end
         viewer = AnalysisViewer:new {
             title = title,
             text = Analysis.window_text(result, pages[idx], idx, total),
-            buttons_table = buttons,
+            buttons_table = #buttons > 0 and buttons or nil,
             add_default_buttons = true,
             nav_enabled = total > 1,
             on_change_page = function(delta) change(delta) end,
@@ -610,11 +624,15 @@ end
 --- Add an "Analyse (JA)" button to the dictionary lookup popup, so the whole
 -- analysis (dictionary form, type, conjugation, dictionary entry, translation,
 -- AI) is available from a normal lookup too.  Shown only for CJK words.
+-- Registered as a transient ("conditional") button so it is always present,
+-- regardless of the user's customized persistent button layout.
 function Japanese:registerDictButton()
     self.ui.dictionary:addToDictButtons({
         id = "japanese_analyse",
         text = _("Analyse (JA)"),
+        conditional = true,
         show_func = function(dict_popup)
+            if dict_popup.is_wiki then return false end
             local w = dict_popup.lookupword or dict_popup.word
             return w ~= nil and util.hasCJKChar(w)
         end,

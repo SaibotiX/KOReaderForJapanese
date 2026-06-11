@@ -1986,15 +1986,30 @@ You can download language data files for Tesseract version 5.3.4 from https://te
 
 Copy the language data files (e.g., eng.traineddata for English and spa.traineddata for Spanish) into koreader/data/tessdata]])
 
-function ReaderHighlight:lookupDictWord()
-    -- convert sboxes to word boxes
+-- Convert the selection's sboxes to screen word boxes (used by the lookup
+-- window to position itself without hiding the word).
+function ReaderHighlight:getSelectedWordBoxes()
     local word_boxes = {}
     for i, sbox in ipairs(self.selected_text.sboxes) do
         word_boxes[i] = self.view:pageToScreenTransform(self.hold_pos.page, sbox)
     end
+    return word_boxes
+end
+
+-- collection_name (optional): restrict the lookup to that dictionary
+-- collection (see ReaderDictionary:lookupWordInCollection).
+function ReaderHighlight:lookupDictWord(collection_name)
+    local word_boxes = self:getSelectedWordBoxes()
+    local function lookup(text)
+        if collection_name then
+            self.ui.dictionary:lookupWordInCollection(text, false, word_boxes, self, self.selected_link, nil, collection_name)
+        else
+            self.ui.dictionary:onLookupWord(text, false, word_boxes, self, self.selected_link)
+        end
+    end
     -- if we extracted text directly
     if #self.selected_text.text > 0 then
-        self.ui.dictionary:onLookupWord(self.selected_text.text, false, word_boxes, self, self.selected_link)
+        lookup(self.selected_text.text)
     -- or we will do OCR
     elseif self.selected_text.sboxes then
         local text = self.ui.document:getOCRText(self.hold_pos.page, self.selected_text.sboxes)
@@ -2012,7 +2027,7 @@ function ReaderHighlight:lookupDictWord()
         end
         logger.dbg("OCRed text:", text)
         if text and text ~= "" then
-            self.ui.dictionary:onLookupWord(text, false, word_boxes, self, self.selected_link)
+            lookup(text)
         else
             UIManager:show(InfoMessage:new{
                 text = info_message_ocr_text,
@@ -2022,20 +2037,6 @@ function ReaderHighlight:lookupDictWord()
             end)
         end
     end
-end
-
--- Like :lookupDictWord, but restricts the lookup to the active dictionary
--- collection (used by the double-tap gesture). Text-only; collection lookups on
--- OCR-only documents fall back to nothing.
-function ReaderHighlight:lookupDictWordInCollection()
-    if not (self.selected_text and #self.selected_text.text > 0) then
-        return
-    end
-    local word_boxes = {}
-    for i, sbox in ipairs(self.selected_text.sboxes) do
-        word_boxes[i] = self.view:pageToScreenTransform(self.hold_pos.page, sbox)
-    end
-    self.ui.dictionary:lookupWordInCollection(self.selected_text.text, false, word_boxes, self, self.selected_link)
 end
 
 function ReaderHighlight:getSelectedWordContext(nb_words)
@@ -2193,22 +2194,26 @@ function ReaderHighlight:onLookupCollectionWord(ges)
     if type(ges) ~= "table" or not ges.pos then
         return false
     end
-    if not (self.ui.dictionary and self.ui.dictionary.getActiveCollectionMembers) then
+    local dictionary = self.ui.dictionary
+    if not (dictionary and dictionary.getCollectionDictNames) then
         return false
     end
-    local members = self.ui.dictionary:getActiveCollectionMembers()
-    if not members then
+    -- Guard before onHold() below, so no selection box is drawn (and left
+    -- behind) when there is nothing to look the word up in.
+    local collection_name = dictionary.active_dict_collection
+    if not collection_name then
         UIManager:show(InfoMessage:new{
             text = _("No dictionary collection is active.\nActivate one in: Dictionary settings → Dictionary collections."),
             timeout = 2,
         })
         return true
     end
-    if #members == 0 then
-        -- An active but empty collection means "look up nothing": don't fall back
-        -- to all dictionaries, just tell the user the collection has no members.
+    local dict_names = dictionary:getCollectionDictNames(collection_name)
+    if not dict_names or #dict_names == 0 then
+        -- An active collection with no (installed) members means "look up
+        -- nothing": don't fall back to all dictionaries, just tell the user.
         UIManager:show(InfoMessage:new{
-            text = _("The active dictionary collection is empty.\nAdd dictionaries to it in: Dictionary settings → Dictionary collections."),
+            text = T(_("The active dictionary collection '%1' has no installed dictionaries.\nAdd some in: Dictionary settings → Dictionary collections."), collection_name),
             timeout = 2,
         })
         return true
@@ -2221,7 +2226,7 @@ function ReaderHighlight:onLookupCollectionWord(ges)
     -- This gesture has no matching hold_release, so cancel the long-hold timer
     -- that onHold() scheduled, then trigger the collection-restricted lookup.
     self:_resetHoldTimer(true)
-    self:lookupDictWordInCollection()
+    self:lookupDictWord(collection_name)
     return true
 end
 

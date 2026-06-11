@@ -202,6 +202,7 @@ function ReaderDictionary:init()
         self.active_dict_collection = nil
         G_reader_settings:delSetting("dict_active_collection")
     end
+    self:refreshCollectionDictButtons()
 
     self:onDispatcherRegisterActions()
 end
@@ -278,6 +279,9 @@ end
 function ReaderDictionary:saveCollections()
     -- Tables are saved by value, so re-save after any mutation.
     G_reader_settings:saveSetting("dict_collections", self.dict_collections)
+    -- Any rename/delete/membership change must be reflected in the buttons
+    -- the collections add to the dictionary window.
+    self:refreshCollectionDictButtons()
 end
 
 -- Older builds stored each collection as a set ({ [name]=true }), which carries
@@ -322,41 +326,29 @@ function ReaderDictionary:setActiveCollection(name)
     end
 end
 
---- Returns the active collection's ordered member list, or nil if no collection
--- is active. The list may be empty: that is a distinct state from "no active
--- collection" (no active collection -> normal lookup; active but empty -> look
--- up nothing). Callers must check #members to tell them apart.
-function ReaderDictionary:getActiveCollectionMembers()
-    if not self.active_dict_collection then
-        return nil
-    end
-    -- May be nil if the setting got out of sync (init clears that case); treat a
-    -- missing collection as "no active collection".
-    return self.dict_collections[self.active_dict_collection]
-end
-
---- The single place where the active collection restricts a lookup.
--- With no active collection the input list is returned unchanged. Otherwise the
--- collection's members are returned in the collection's own saved order (keeping
--- only those still installed) -- a true override of each dictionary's global
--- enabled/disabled state. An active but empty collection returns an empty list,
--- i.e. "look up nothing".
-function ReaderDictionary:filterByActiveCollection(dict_names)
-    local members = self:getActiveCollectionMembers()
+--- Returns the ordered list of a collection's member dictionaries that are
+-- still installed, or nil if no such collection exists. The returned list may
+-- be empty (collection with no members, or none of them installed): that is a
+-- distinct state from "no such collection" (no collection -> normal lookup;
+-- empty -> look up nothing). Callers must check #dict_names to tell them apart.
+-- The order is the collection's own saved order -- a true override of each
+-- dictionary's global enabled/disabled state and of the global dictionary order.
+function ReaderDictionary:getCollectionDictNames(collection_name)
+    local members = collection_name and self.dict_collections[collection_name]
     if not members then
-        return dict_names
+        return nil
     end
     local available_set = {}
     for _, ifo in ipairs(available_ifos) do
         available_set[ifo.name] = true
     end
-    local filtered = {}
+    local dict_names = {}
     for _, dict_name in ipairs(members) do
         if available_set[dict_name] then
-            table.insert(filtered, dict_name)
+            table.insert(dict_names, dict_name)
         end
     end
-    return filtered
+    return dict_names
 end
 
 function ReaderDictionary:getSortedCollectionNames()
@@ -375,6 +367,68 @@ function ReaderDictionary:toggleCollectionActive(name)
     else
         self:setActiveCollection(name)
         Notification:notify(T(_("Dictionary collection activated: %1"), name))
+    end
+end
+
+local DICT_COLLECTION_BUTTON_PREFIX = "dict_collection_"
+local DICT_COLLECTION_BUTTONS_PER_ROW = 3
+
+--- (Re)register one dictionary-window button per collection, so every
+-- collection can be queried straight from the dictionary window: tapping a
+-- collection's button looks the displayed word up again using only that
+-- collection's dictionaries. A window whose results came from a collection
+-- hides that collection's button and offers "All dictionaries" instead, to
+-- broaden the lookup back out.
+-- They are registered as transient ("conditional") buttons, appended below the
+-- user's customizable button layout, so they are always available and never
+-- saved into the layout settings. Called on init and after every collection
+-- mutation (see :saveCollections).
+function ReaderDictionary:refreshCollectionDictButtons()
+    for id in pairs(self._dict_buttons) do
+        if id:sub(1, #DICT_COLLECTION_BUTTON_PREFIX) == DICT_COLLECTION_BUTTON_PREFIX then
+            self._dict_buttons[id] = nil
+        end
+    end
+    local entries = {}
+    for _, name in ipairs(self:getSortedCollectionNames()) do
+        table.insert(entries, {
+            text = name,
+            show_func = function(dict_popup)
+                -- Hide the collection the window's results came from:
+                -- re-running the same restricted lookup would just reopen an
+                -- identical window.
+                return not dict_popup.is_wiki and dict_popup.source_collection ~= name
+            end,
+            callback = function(dict_popup)
+                self:lookupWordInCollection(dict_popup.lookupword or dict_popup.word, true,
+                    dict_popup.word_boxes, nil, nil, nil, name)
+            end,
+        })
+    end
+    if #entries == 0 then
+        return -- no collections: keep the dictionary window unchanged
+    end
+    table.insert(entries, {
+        text = _("All dictionaries"),
+        show_func = function(dict_popup)
+            -- Only useful as an escape hatch from a collection-restricted window.
+            return not dict_popup.is_wiki and dict_popup.source_collection ~= nil
+        end,
+        callback = function(dict_popup)
+            self:onLookupWord(dict_popup.lookupword or dict_popup.word, true, dict_popup.word_boxes)
+        end,
+    })
+    for i, entry in ipairs(entries) do
+        local row = math.ceil(i / DICT_COLLECTION_BUTTONS_PER_ROW)
+        self:addToDictButtons({
+            -- Zero-padded so ffiUtil.orderedPairs keeps registration order.
+            id = string.format("%s%02d", DICT_COLLECTION_BUTTON_PREFIX, i),
+            text = entry.text,
+            conditional = true,
+            row_group = string.format("%srow_%02d", DICT_COLLECTION_BUTTON_PREFIX, row),
+            show_func = entry.show_func,
+            callback = entry.callback,
+        })
     end
 end
 
@@ -525,7 +579,7 @@ end
 
 -- Pick and order the member dictionaries of a collection. The SortWidget lets
 -- the user both toggle membership and arrange the order; that order is the
--- collection's own lookup priority (see :filterByActiveCollection).
+-- collection's own lookup priority (see :getCollectionDictNames).
 function ReaderDictionary:showCollectionEditor(name, done_callback)
     local members = self.dict_collections[name] or {}
     local selected = {}
@@ -697,7 +751,7 @@ function ReaderDictionary:addToMainMenu(menu_items)
                     end
                     return _("Dictionary collections")
                 end,
-                help_text = _("Collections are named bundles of dictionaries, each with its own order. Activate one here, then use the gesture you assigned to 'Look up word in dictionary collection' on a word to look it up using only that collection's dictionaries, in the collection's own order. This is a true override: a collection's dictionaries are always searched, even ones disabled globally or disabled for the current book, and every other dictionary is suppressed. A normal long-press keeps looking up words in all enabled dictionaries, as usual.\n\nAssign the gesture in 'Taps and gestures'. Unlike presets, collections never change which dictionaries are enabled."),
+                help_text = _("Collections are named bundles of dictionaries, each with its own order. Each collection gets its own button in the dictionary lookup window: tapping it looks the word up again using only that collection's dictionaries, in the collection's own order. This is a true override: a collection's dictionaries are always searched, even ones disabled globally or disabled for the current book, and every other dictionary is suppressed. A normal long-press keeps looking up words in all enabled dictionaries, as usual.\n\nYou can also activate one collection here and assign the 'Look up word in dictionary collection' gesture in 'Taps and gestures' to look a word up in the active collection directly. Unlike presets, collections never change which dictionaries are enabled."),
                 sub_item_table_func = function()
                     return self:genCollectionsMenuItemTable()
                 end,
@@ -1218,13 +1272,20 @@ function ReaderDictionary:showPreferredDictsDialog(touchmenu_instance)
     UIManager:show(dialog)
 end
 
--- skip_doc_disabled: when true, the per-book "disabled for this book" list is
--- not applied to dict_names (used by collection lookups, which are a true
--- override of every dictionary-suppression mechanism).
--- force_exact: when true, the lookup is forced to exact (1-to-1) matching, no
--- fuzzy/approximate results, regardless of the main fuzzy-search setting (used
--- by the collection "Exact match only" option, which is independent of it).
-function ReaderDictionary:onLookupWord(word, is_sane, boxes, highlight, link, dict_close_callback, dict_names, skip_doc_disabled, force_exact)
+-- opts (optional table) restricts/configures the lookup; used by collection
+-- lookups (see :lookupWordInCollection). Supported fields:
+--   dict_names: explicit, already-filtered list of dictionary names to search,
+--     instead of all enabled ones.
+--   skip_doc_disabled: don't apply the per-book "disabled for this book" list
+--     to the dictionaries searched (collections are a true override of every
+--     dictionary-suppression mechanism).
+--   force_exact: force exact (1-to-1) matching, no fuzzy/approximate results,
+--     regardless of the main fuzzy-search setting (used by the collection
+--     "Exact match only" option, which is independent of it).
+--   source_collection: name of the collection this lookup is restricted to;
+--     passed through to the result window so its buttons can adapt.
+function ReaderDictionary:onLookupWord(word, is_sane, boxes, highlight, link, dict_close_callback, opts)
+    opts = opts or {}
     logger.dbg("dict lookup word:", word, boxes)
     -- escape quotes and other funny characters in word
     word = self:cleanSelection(word, is_sane)
@@ -1236,7 +1297,7 @@ function ReaderDictionary:onLookupWord(word, is_sane, boxes, highlight, link, di
 
     self.highlight = highlight
     local disable_fuzzy_search
-    if force_exact then
+    if opts.force_exact then
         -- Collection "Exact match only": override fuzzy regardless of the main
         -- per-document / file-manager fuzzy setting.
         disable_fuzzy_search = true
@@ -1247,30 +1308,46 @@ function ReaderDictionary:onLookupWord(word, is_sane, boxes, highlight, link, di
     end
 
     -- Default to all enabled dictionaries (normal long-press lookup). A caller
-    -- such as the dictionary-collection gesture may pass an explicit,
-    -- already-filtered list of names to restrict the lookup instead.
-    dict_names = dict_names or self.enabled_dict_names
+    -- such as a collection lookup may pass an explicit, already-filtered list
+    -- of names to restrict the lookup instead.
+    local dict_names = opts.dict_names or self.enabled_dict_names
 
     -- Wrapped through Trapper, as we may be using Trapper:dismissablePopen() in it
     Trapper:wrap(function()
-        self:stardictLookup(word, dict_names, not disable_fuzzy_search, boxes, link, dict_close_callback, skip_doc_disabled, force_exact)
+        self:stardictLookup(word, dict_names, not disable_fuzzy_search, boxes, link, dict_close_callback, opts)
     end)
     return true
 end
 
---- Look up a word using only the active dictionary collection.
--- The single restricted-lookup entry point (used by the double-tap gesture).
--- With no active collection, :filterByActiveCollection returns the full list, so
--- this gracefully behaves like a normal lookup. skip_doc_disabled=true makes it
--- a true override: the collection's members are searched even if disabled for
--- this book. (The gesture handler guards against an active-but-empty collection,
--- so we don't reach here with an empty dict_names that would search nothing.)
-function ReaderDictionary:lookupWordInCollection(word, is_sane, boxes, highlight, link, dict_close_callback)
-    local dict_names = self:filterByActiveCollection(self.enabled_dict_names)
-    -- Independent of the main dictionary's fuzzy setting (see the "Exact match
-    -- only" toggle in the Dictionary collections submenu).
-    local force_exact = G_reader_settings:isTrue("dict_collection_exact_search")
-    return self:onLookupWord(word, is_sane, boxes, highlight, link, dict_close_callback, dict_names, true, force_exact)
+--- Look up a word using only the given dictionary collection (default: the
+-- active one). The single restricted-lookup entry point, used by the
+-- "Look up word in dictionary collection" gesture and by the per-collection
+-- buttons in the dictionary window. skip_doc_disabled=true makes it a true
+-- override: the collection's members are searched even if disabled globally or
+-- for this book. With no such collection (e.g. none active), it gracefully
+-- behaves like a normal lookup; with a collection that has no installed
+-- members, it looks up nothing and tells the user why.
+function ReaderDictionary:lookupWordInCollection(word, is_sane, boxes, highlight, link, dict_close_callback, collection_name)
+    collection_name = collection_name or self.active_dict_collection
+    local dict_names = self:getCollectionDictNames(collection_name)
+    if not dict_names then
+        return self:onLookupWord(word, is_sane, boxes, highlight, link, dict_close_callback)
+    end
+    if #dict_names == 0 then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Dictionary collection '%1' has no installed dictionaries.\nAdd some in: Dictionary settings → Dictionary collections."), collection_name),
+            timeout = 2,
+        })
+        return true
+    end
+    return self:onLookupWord(word, is_sane, boxes, highlight, link, dict_close_callback, {
+        dict_names = dict_names,
+        skip_doc_disabled = true,
+        -- Independent of the main dictionary's fuzzy setting (see the "Exact
+        -- match only" toggle in the Dictionary collections submenu).
+        force_exact = G_reader_settings:isTrue("dict_collection_exact_search"),
+        source_collection = collection_name,
+    })
 end
 
 function ReaderDictionary:onHtmlDictionaryLinkTapped(dictionary, link)
@@ -1840,7 +1917,10 @@ function ReaderDictionary:startSdcv(word, dict_names, fuzzy_search, force_exact)
     return results
 end
 
-function ReaderDictionary:stardictLookup(word, dict_names, fuzzy_search, boxes, link, dict_close_callback, skip_doc_disabled, force_exact)
+-- opts: see ReaderDictionary:onLookupWord (skip_doc_disabled, force_exact,
+-- source_collection are used here; dict_names was already resolved by then).
+function ReaderDictionary:stardictLookup(word, dict_names, fuzzy_search, boxes, link, dict_close_callback, opts)
+    opts = opts or {}
     local book_title = self.ui.doc_props and self.ui.doc_props.display_title or _("Dictionary lookup")
 
     -- Event for plugin to catch lookup with book title
@@ -1872,7 +1952,7 @@ function ReaderDictionary:stardictLookup(word, dict_names, fuzzy_search, boxes, 
     -- Before starting the search, remove any dictionaries that were disabled for
     -- *this* book. Collection lookups pass skip_doc_disabled to bypass this, so a
     -- collection is a true override of the per-book disable too.
-    if dict_names and not skip_doc_disabled and self.doc_disabled_dicts then
+    if dict_names and not opts.skip_doc_disabled and self.doc_disabled_dicts then
         local filtered_names = {}
         for _, name in ipairs(dict_names) do
             if not self.doc_disabled_dicts[name] then
@@ -1894,14 +1974,14 @@ function ReaderDictionary:stardictLookup(word, dict_names, fuzzy_search, boxes, 
                 lookup_cancelled = false,
             }
         }
-        self:showDict(word, nope, boxes, link, dict_close_callback)
+        self:showDict(word, nope, boxes, link, dict_close_callback, opts.source_collection)
         return
     end
 
     self:showLookupInfo(word, self.lookup_msg_delay)
 
     self._lookup_start_time = UIManager:getTime()
-    local results = self:startSdcv(word, dict_names, fuzzy_search, force_exact)
+    local results = self:startSdcv(word, dict_names, fuzzy_search, opts.force_exact)
     local function lookupCancelled()
         if self.highlight then
             self.highlight:clear()
@@ -1920,14 +2000,14 @@ function ReaderDictionary:stardictLookup(word, dict_names, fuzzy_search, boxes, 
     end
     -- Intercept "No results" to offer alternative search methods (e.g., fuzzy search to non-fussy people)
     if results and results[1].no_result then
-        local handled = self:showNoResultsDialog(word, dict_names, fuzzy_search, boxes, link, dict_close_callback, lookupCancelled, skip_doc_disabled)
+        local handled = self:showNoResultsDialog(word, dict_names, fuzzy_search, boxes, link, dict_close_callback, lookupCancelled, opts)
         if handled then return end
     end
 
-    self:showDict(word, tidyMarkup(results), boxes, link, dict_close_callback)
+    self:showDict(word, tidyMarkup(results), boxes, link, dict_close_callback, opts.source_collection)
 end
 
-function ReaderDictionary:showDict(word, results, boxes, link, dict_close_callback)
+function ReaderDictionary:showDict(word, results, boxes, link, dict_close_callback, source_collection)
     if results and results[1] then
         logger.dbg("showing quick lookup window", #DictQuickLookup.window_list+1, ":", word, results)
         self.dict_window = DictQuickLookup:new{
@@ -1943,6 +2023,8 @@ function ReaderDictionary:showDict(word, results, boxes, link, dict_close_callba
             preferred_dictionaries = self.preferred_dictionaries,
             -- differentiate between dict and wiki
             is_wiki = self.is_wiki,
+            -- collection the lookup was restricted to, if any
+            source_collection = source_collection,
             refresh_callback = function()
                 if self.view then
                     -- update info in footer (time, battery, etc)
@@ -1982,8 +2064,14 @@ function ReaderDictionary:showDict(word, results, boxes, link, dict_close_callba
     end
 end
 
-function ReaderDictionary:showNoResultsDialog(word, dict_names, fuzzy_search, boxes, link, dict_close_callback, lookupCancelled, skip_doc_disabled)
+function ReaderDictionary:showNoResultsDialog(word, dict_names, fuzzy_search, boxes, link, dict_close_callback, lookupCancelled, opts)
     self:dismissLookupInfo() -- Close the "Searching..." message
+    -- Keep any collection restriction on retries, but not force_exact: the
+    -- whole point of the retry is the user explicitly asking for fuzzy results.
+    local retry_opts = opts and {
+        skip_doc_disabled = opts.skip_doc_disabled,
+        source_collection = opts.source_collection,
+    } or nil
     local preset_names = Presets.getPresets(self.preset_obj)
     local has_presets = preset_names and #preset_names > 0
     if fuzzy_search and not has_presets then return false end -- fall through to showing empty results
@@ -2009,7 +2097,7 @@ function ReaderDictionary:showNoResultsDialog(word, dict_names, fuzzy_search, bo
                 if new_word == "" then return end
                 UIManager:close(dialog)
                 -- Re-run the lookup with the (possibly edited) word and fuzzy enabled.
-                self:stardictLookup(new_word, dict_names, true, boxes, link, dict_close_callback, skip_doc_disabled)
+                self:stardictLookup(new_word, dict_names, true, boxes, link, dict_close_callback, retry_opts)
             end,
         }
     elseif has_presets then

@@ -59,6 +59,9 @@ Conditional or transient (`conditional == true`):
 - Runtime-only, appended via `extra_layout`.
 - Not user-toggleable in persistent customization.
 - Usually used for context-dependent actions (review buttons, link-dependent actions, etc).
+- If the id is already placed in the effective persistent layout (e.g. a saved
+  config from when the button was registered as non-conditional), the transient
+  row is skipped so the button doesn't show up twice.
 
 ### Conditional row grouping rules
 
@@ -165,6 +168,9 @@ local DictQuickLookup = InputContainer:extend{
     nt_text_selector_indicator = nil, -- crosshairs for text selection on non-touch devices
     -- sboxes containing highlighted text, quick lookup window tries to not hide the word
     word_boxes = nil,
+    -- name of the dictionary collection the lookup was restricted to, if any
+    -- (lets plugin buttons adapt, e.g. offer "All dictionaries" instead)
+    source_collection = nil,
 
     -- refresh_callback will be called before we trigger full refresh in onSwipe
     refresh_callback = nil,
@@ -936,7 +942,10 @@ function DictQuickLookup.layoutContainsButtonId(layout, button_id)
     return false
 end
 
-function DictQuickLookup:populatePluginButtons(pool, default_layout, extra_layout)
+function DictQuickLookup:populatePluginButtons(pool, default_layout, extra_layout, base_layout)
+    -- base_layout is the layout the window will actually use (the user's saved
+    -- config or the default layout): a conditional button already placed there
+    -- must not be added as a transient row again, or it would show up twice.
     local dict_buttons = self.ui.dictionary._dict_buttons
     if not dict_buttons then return end
 
@@ -991,8 +1000,9 @@ function DictQuickLookup:populatePluginButtons(pool, default_layout, extra_layou
             pool[spec.id] = button
 
             if spec.conditional then
-                local row_key = spec.row_group
-                add_conditional_button(row_key or spec.id, spec.id)
+                if not self.layoutContainsButtonId(base_layout, spec.id) then
+                    add_conditional_button(spec.row_group or spec.id, spec.id)
+                end
             elseif default_layout and not self.layoutContainsButtonId(default_layout, spec.id) then
                 local i = spec.insert_first and 1 or (#default_layout + 1)
                 table.insert(default_layout, i, { spec.id })
@@ -1016,8 +1026,11 @@ function DictQuickLookup:buildButtonLayout()
         return { { pool.save, pool.close } }
     end
     local buttons = {}
+    -- Wiki has a fixed, non-configurable layout (yet!); dict windows use the
+    -- user's saved button config when present, the default layout otherwise.
+    local config = not self.is_wiki and G_reader_settings:readSetting("dict_button_config") or nil
     local default_layout = nil
-    if G_reader_settings:hasNot("dict_button_config") or self.is_wiki then
+    if not config or self.is_wiki then
         default_layout = self.ui.dictionary.default_layout
     end
     local extra_layout = {} -- transient buttons.
@@ -1027,19 +1040,13 @@ function DictQuickLookup:buildButtonLayout()
         table.insert(extra_layout, { "link" })
     end
     if self.ui and self.ui.dictionary then
-        self:populatePluginButtons(pool, default_layout, extra_layout)
+        self:populatePluginButtons(pool, default_layout, extra_layout, config and config.layout or default_layout)
     end
 
-    local button_layout
-    -- Wiki has a fixed, non-configurable layout (yet!)
-    if self.is_wiki then
-        button_layout = default_layout
-    else
-        -- We must do util.tableDeepCopy here so we don't accidentally save
-        -- transient buttons into user settings!
-        local config = G_reader_settings:readSetting("dict_button_config")
-        button_layout = util.tableDeepCopy(config and config.layout or default_layout)
-    end
+    -- We must do util.tableDeepCopy here so the transient rows appended below
+    -- don't accumulate in the session-shared default layout (wiki windows used
+    -- to take it by reference), and don't get saved into user settings!
+    local button_layout = util.tableDeepCopy(config and config.layout or default_layout)
 
     local frame_bordersize = Size.border.window
     local inner_width = self.width - 2 * frame_bordersize
