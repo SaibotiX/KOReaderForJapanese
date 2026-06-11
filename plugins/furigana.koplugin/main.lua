@@ -16,6 +16,8 @@ The heavy lifting lives in:
 
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
+local Dispatcher = require("dispatcher")
+local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
@@ -28,6 +30,7 @@ local N_ = _.ngettext
 local T = require("ffi/util").template
 
 local EpubAnnotator = require("epubannotator")
+local ReadingExtractor = require("readingextractor")
 
 local Furigana = WidgetContainer:extend{
     name = "furigana",
@@ -49,8 +52,18 @@ function Furigana:init()
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
+    self:onDispatcherRegisterActions()
     self:redirectFileBrowserToOriginal()
     self:maybeAutoOpenAnnotated()
+end
+
+function Furigana:onDispatcherRegisterActions()
+    Dispatcher:registerAction("furigana_reveal_word", {
+        category = "arg",
+        event = "ShowWordFurigana",
+        title = _("Show furigana for word"),
+        reader = true,
+    })
 end
 
 -- On opening a plain book, if it was last read with furigana, reopen the cached
@@ -201,6 +214,164 @@ function Furigana:getTokenizer()
     -- Loaded on demand and dropped after use (the FFI dictionary is ~35 MB).
     local Tokenizer = require("tokenizer")
     return Tokenizer.new(self.path .. "/dict", self:getMinGrade())
+end
+
+--- Tokenizer kept loaded for per-word use (tap-reveal popups, and the Japanese
+-- plugin's reading labels), with every kanji annotated regardless of the
+-- whole-book reading level: the user explicitly asked for this word's reading.
+-- Held until the reader instance is torn down (document close/switch).
+function Furigana:getCachedTokenizer()
+    if not self._cached_tok then
+        local tok = self:getTokenizer()
+        if tok.setMinGrade then tok:setMinGrade(1) end
+        self._cached_tok = tok
+    end
+    return self._cached_tok
+end
+
+-- --------------------------------------------------------------- tap reveal --
+-- Anki-style on-demand furigana: tap a word in the (un-annotated) book and a
+-- small popup with just that word's reading appears above it. The popup is
+-- generated on the fly from the tokenizer — the book file is never touched, so
+-- this works without generating the annotated copy.
+
+function Furigana:isTapRevealEnabled()
+    return G_reader_settings:nilOrTrue("furigana_tap_reveal")
+end
+
+--- Register the whole-screen single-tap zone once the reader is ready. It runs
+-- before the Japanese plugin's analysis tap (and the page-turn taps), and
+-- declines (returns false) when it has nothing to show, letting the tap fall
+-- through to those.
+function Furigana:onReaderReady()
+    if self._reveal_zone_registered then return end
+    if not (self.ui and self.ui.registerTouchZones and self.ui.rolling) then return end
+    self.ui:registerTouchZones({
+        {
+            id = "furigana_reveal_tap",
+            ges = "tap",
+            screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 },
+            overrides = {
+                "japanese_analyse_tap",
+                "readerhighlight_tap",
+                "tap_top_left_corner", "tap_top_right_corner",
+                "tap_left_bottom_corner", "tap_right_bottom_corner",
+                "tap_forward", "tap_backward",
+            },
+            handler = function(ges) return self:onTapReveal(ges) end,
+        },
+    })
+    self._reveal_zone_registered = true
+end
+
+function Furigana:onTapReveal(ges)
+    if not self:isTapRevealEnabled() then return false end
+    return self:revealAtPos(ges and ges.pos) or false
+end
+
+--- Gesture-bound entry point ("Show furigana for word", category="arg": the
+-- bound gesture's object, with its position, is passed through).
+function Furigana:onShowWordFurigana(ges)
+    if type(ges) == "table" and ges.pos and self:revealAtPos(ges.pos) then
+        return true
+    end
+    UIManager:show(InfoMessage:new{
+        text = _("Tap on a Japanese word to show its reading."),
+        timeout = 2,
+    })
+    return true
+end
+
+--- Show the reading of the word at screen position `pos` in a popup anchored
+-- above it. Returns true if a popup was shown (false: nothing Japanese there,
+-- so a tap can fall through to other handlers).
+function Furigana:revealAtPos(screen_pos)
+    if not (screen_pos and self.ui and self.ui.document and self.ui.view) then return false end
+    if not self.ui.rolling then return false end -- crengine/EPUB only
+    -- In an annotated copy the readings are already visible (and the extracted
+    -- text would interleave them, confusing the tokenizer).
+    if self:isShowingAnnotated() then return false end
+    -- Copy the point: screenToPageTransform mutates it (adds .page).
+    local pos = self.ui.view:screenToPageTransform({ x = screen_pos.x, y = screen_pos.y })
+    if not pos then return false end
+    local ok, word = pcall(self.ui.document.getWordFromPosition, self.ui.document, pos, true)
+    if not (ok and word and word.word and word.word ~= "" and word.pos0 and word.pos1) then
+        return false
+    end
+    if not util.hasCJKChar(word.word) then return false end
+    -- crengine's CJK "word" is often just the tapped character: grow it to the
+    -- full dictionary word before annotating, so the popup covers the whole word.
+    word.word = self:expandTappedWord(word)
+
+    local display = self:getWordReadingDisplay(word)
+    if not display then return false end
+
+    local ReadingPopup = require("readingpopup")
+    UIManager:show(ReadingPopup:new{
+        text = display,
+        anchor_box = word.sbox and self.ui.view:pageToScreenTransform(pos.page, word.sbox),
+        tap_callback = function()
+            -- Tap on the popup: escalate to the full word analysis
+            -- (handled by japanese.koplugin; a no-op without it).
+            self.ui:handleEvent(Event:new("ShowJapaneseAnalysis",
+                { pos = { x = screen_pos.x, y = screen_pos.y } }))
+        end,
+    })
+    return true
+end
+
+--- Expand the tapped (often single-character) crengine word to the full
+-- dictionary word, exactly the way the Japanese plugin's lookups do: scan
+-- forward from the tap, deinflect each candidate with the Yomichan rules
+-- (yomichan-deinflect.json) and keep the longest form found in the user's
+-- dictionaries (one batched sdcv call). Word start is the tapped character,
+-- like in Yomichan. Returns the crengine word unchanged when the Japanese
+-- plugin is unavailable or nothing matches (expandWord falls back itself).
+function Furigana:expandTappedWord(word)
+    local japanese = self.ui and self.ui.japanese
+    if not (japanese and japanese.expandWord) then return word.word end
+    local ok, expanded = pcall(japanese.expandWord, japanese, word)
+    if ok and type(expanded) == "string" and expanded ~= "" then
+        return expanded
+    end
+    return word.word
+end
+
+--- The popup text for a tapped word: its token(s) with readings spliced in,
+-- e.g. 食（た）べた. Returns nil when there is nothing to show.
+function Furigana:getWordReadingDisplay(word)
+    local ok_tok, tok = pcall(function() return self:getCachedTokenizer() end)
+    if not ok_tok or not tok then
+        logger.err("furigana: reveal: could not load the dictionary:", tok)
+        return nil
+    end
+    local doc = self.ui.document
+    -- Tokenize the whole sentence, so the Viterbi sees the same context the
+    -- whole-book annotator would (same segmentation, same readings).
+    local text, word_off
+    local ok_sent, sent = pcall(doc.extendXPointersToSentenceSegment, doc, word.pos0, word.pos1)
+    if ok_sent and sent and sent.text and sent.text ~= "" and sent.pos0 then
+        local ok_prefix, prefix = pcall(doc.getTextFromXPointers, doc, sent.pos0, word.pos0)
+        if ok_prefix and prefix then
+            text = sent.text
+            word_off = #prefix
+        end
+    end
+    -- The computed offset must land exactly on the tapped word. It may not in
+    -- books with native ruby (crengine's extracted text interleaves the rt
+    -- readings); fall back to tokenizing the bare word without context.
+    if not (text and word_off and text:sub(word_off + 1, word_off + #word.word) == word.word) then
+        text = word.word
+        word_off = 0
+    end
+    local runs, plain = ReadingExtractor.parse(tok:annotate(text))
+    if plain ~= text then
+        -- The tokenizer must give the plain text back unchanged, or the run
+        -- offsets cannot be trusted.
+        logger.warn("furigana: reveal: annotate round-trip mismatch")
+        return nil
+    end
+    return ReadingExtractor.display(plain, runs, word_off, #word.word)
 end
 
 -- ------------------------------------------------------------------- toggle --
@@ -755,6 +926,18 @@ function Furigana:addToMainMenu(menu_items)
                 help_text = _([[Generate furigana (ruby) readings for the current Japanese EPUB and reopen it with the readings shown.
 
 The readings are generated on-device; the first run on a book may take a little while, after which the result is cached. Toggle again to return to the original book.]]),
+            },
+            {
+                text = _("Tap a word to show its reading"),
+                checked_func = function() return self:isTapRevealEnabled() end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:flipNilOrTrue("furigana_tap_reveal")
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _([[Show a small popup with a word's reading when you tap it, without annotating the whole book — like tapping a word in Anki. The first tap in a session loads the dictionary, which takes a moment. Tap the popup itself to open the full word analysis (needs the Japanese plugin).
+
+This takes priority over the Japanese plugin's 'Tap a word to analyse it'; disable it here to get that back on single tap. 'Show furigana for word' can also be bound to any gesture.]]),
             },
             {
                 text = _("Reading level"),

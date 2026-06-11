@@ -236,12 +236,20 @@ end
 
 --- The furigana plugin's tokenizer (lazy, cached), set to annotate every kanji
 -- so we get a full reading.  nil when the furigana plugin is unavailable.
+-- Prefers the furigana plugin's own cached instance (also used by its
+-- tap-reveal popups), so the ~35 MB dictionary is loaded only once.
 function Japanese:getFuriganaTokenizer()
     if self._furigana_tried then return self._furigana_tok end
     self._furigana_tried = true
-    if self.ui and self.ui.furigana and self.ui.furigana.getTokenizer then
+    local furigana = self.ui and self.ui.furigana
+    if furigana and (furigana.getCachedTokenizer or furigana.getTokenizer) then
         local ok, tok = pcall(function()
-            local t = self.ui.furigana:getTokenizer()
+            local t
+            if furigana.getCachedTokenizer then
+                t = furigana:getCachedTokenizer() -- already min_grade 1
+            else
+                t = furigana:getTokenizer()
+            end
             if t.setMinGrade then t:setMinGrade(1) end -- annotate all kanji
             return t
         end)
