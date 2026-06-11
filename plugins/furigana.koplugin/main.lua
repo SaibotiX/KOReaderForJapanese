@@ -53,8 +53,52 @@ function Furigana:init()
         self.ui.menu:registerToMainMenu(self)
     end
     self:onDispatcherRegisterActions()
+    self:registerSpeakButtons()
     self:redirectFileBrowserToOriginal()
     self:maybeAutoOpenAnnotated()
+end
+
+--- Add "Speak" entries to the text-selection (highlight) dialog and to the
+-- dictionary window, both synthesizing the text through VOICEVOX (see
+-- :speakText). Available whenever the selection/word contains Japanese,
+-- independently of the tap-audio toggle.
+function Furigana:registerSpeakButtons()
+    if self.ui and self.ui.highlight and self.ui.highlight.addToHighlightDialog then
+        -- "12_search" is kept last in the dialog; "12_a..." sorts just before it.
+        self.ui.highlight:addToHighlightDialog("12_a_voicevox_speak", function(this)
+            return {
+                text = _("Speak (VOICEVOX)"),
+                show_in_highlight_dialog_func = function()
+                    return this.selected_text and this.selected_text.text
+                        and util.hasCJKChar(this.selected_text.text) or false
+                end,
+                callback = function()
+                    local text = util.cleanupSelectedText(this.selected_text.text)
+                    this:onClose()
+                    self:speakText(text)
+                end,
+            }
+        end)
+    end
+    if self.ui and self.ui.dictionary and self.ui.dictionary.addToDictButtons then
+        self.ui.dictionary:addToDictButtons({
+            id = "furigana_speak",
+            text = _("Speak (JA)"),
+            conditional = true,
+            -- Shares a transient row with japanese.koplugin's "Analyse (JA)".
+            row_group = "ja_word_actions",
+            show_func = function(dict_popup)
+                if dict_popup.is_wiki then return false end
+                local w = dict_popup.word or dict_popup.lookupword
+                return w ~= nil and util.hasCJKChar(w)
+            end,
+            callback = function(dict_popup)
+                -- The original selection (the form as written in the book),
+                -- not the displayed headword.
+                self:speakText(dict_popup.word or dict_popup.lookupword)
+            end,
+        })
+    end
 end
 
 function Furigana:onDispatcherRegisterActions()
@@ -265,14 +309,15 @@ function Furigana:onReaderReady()
 end
 
 function Furigana:onTapReveal(ges)
-    if not self:isTapRevealEnabled() then return false end
+    if not (self:isTapRevealEnabled() or self:isTapAudioEnabled()) then return false end
     return self:revealAtPos(ges and ges.pos) or false
 end
 
 --- Gesture-bound entry point ("Show furigana for word", category="arg": the
--- bound gesture's object, with its position, is passed through).
+-- bound gesture's object, with its position, is passed through). An explicit
+-- gesture always shows the popup, even when the single-tap toggle is off.
 function Furigana:onShowWordFurigana(ges)
-    if type(ges) == "table" and ges.pos and self:revealAtPos(ges.pos) then
+    if type(ges) == "table" and ges.pos and self:revealAtPos(ges.pos, true) then
         return true
     end
     UIManager:show(InfoMessage:new{
@@ -282,10 +327,12 @@ function Furigana:onShowWordFurigana(ges)
     return true
 end
 
---- Show the reading of the word at screen position `pos` in a popup anchored
--- above it. Returns true if a popup was shown (false: nothing Japanese there,
--- so a tap can fall through to other handlers).
-function Furigana:revealAtPos(screen_pos)
+--- Reveal the word at screen position `pos`: a reading popup anchored above
+-- it, its VOICEVOX audio, or both — per the two independent toggles
+-- (want_popup forces the popup, used by the explicit gesture). Returns true
+-- when the tap did something (false: nothing Japanese there, or both features
+-- idle, so a tap can fall through to other handlers).
+function Furigana:revealAtPos(screen_pos, want_popup)
     if not (screen_pos and self.ui and self.ui.document and self.ui.view) then return false end
     if not self.ui.rolling then return false end -- crengine/EPUB only
     -- In an annotated copy the readings are already visible (and the extracted
@@ -300,11 +347,24 @@ function Furigana:revealAtPos(screen_pos)
     end
     if not util.hasCJKChar(word.word) then return false end
     -- crengine's CJK "word" is often just the tapped character: grow it to the
-    -- full dictionary word before annotating, so the popup covers the whole word.
+    -- full dictionary word, so popup and audio cover the whole word.
     word.word = self:expandTappedWord(word)
 
-    local display = self:getWordReadingDisplay(word)
-    if not display then return false end
+    -- Start the audio first (when enabled): the popup's first-time tokenizer
+    -- load must not delay it. Audio also covers kana-only words, which have
+    -- no reading to show.
+    local audio_started = false
+    if self:isTapAudioEnabled() then
+        audio_started = self:speakText(word.word) or false
+    end
+
+    local display
+    if want_popup or self:isTapRevealEnabled() then
+        display = self:getWordReadingDisplay(word)
+    end
+    if not display then
+        return audio_started
+    end
 
     local ReadingPopup = require("readingpopup")
     UIManager:show(ReadingPopup:new{
@@ -372,6 +432,127 @@ function Furigana:getWordReadingDisplay(word)
         return nil
     end
     return ReadingExtractor.display(plain, runs, word_off, #word.word)
+end
+
+-- --------------------------------------------------------------- word audio --
+-- Optional VOICEVOX audio for the tapped word: the word is synthesized by a
+-- self-hosted VOICEVOX engine (configure its URL in the menu), cached as a
+-- WAV under the furigana cache, and played through the platform player
+-- (Android MediaPlayer via JNI; a CLI player on the emulator/desktop).
+-- Fully independent of the reading popup: enable either one, both, or neither.
+
+function Furigana:isTapAudioEnabled()
+    return G_reader_settings:isTrue("furigana_tap_audio")
+end
+
+function Furigana:voicevoxOpts()
+    local VoiceVox = require("voicevox")
+    return {
+        url = G_reader_settings:readSetting("furigana_voicevox_url") or VoiceVox.DEFAULT_URL,
+        speaker = G_reader_settings:readSetting("furigana_voicevox_speaker") or VoiceVox.DEFAULT_SPEAKER,
+    }
+end
+
+function Furigana:audioCachePathFor(opts, text)
+    local key = hash_str(("%s|%s|%s"):format(opts.url, opts.speaker, text))
+    return self.cache_dir .. "/audio/" .. key .. ".wav"
+end
+
+function Furigana:playAudioFile(path)
+    local AudioPlayer = require("audioplayer")
+    local ok, err = AudioPlayer:play(path)
+    if not ok then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Audio playback failed: %1"), tostring(err)),
+            timeout = 3,
+        })
+    end
+    return ok
+end
+
+--- Speak `text` (a word, sentence, or any selection) through VOICEVOX:
+-- cached text plays immediately; otherwise the WAV is fetched in a
+-- dismissable subprocess (a new tap dismisses the wait and takes over),
+-- cached, then played. Returns true when playback was started or scheduled —
+-- callers treat that as "the tap did something". Not gated on the tap-audio
+-- toggle: the highlight-dialog and dictionary-window Speak buttons work
+-- independently of it.
+function Furigana:speakText(text)
+    if not (text and text ~= "") then return false end
+    local opts = self:voicevoxOpts()
+    if opts.url == "" then return false end
+    local path = self:audioCachePathFor(opts, text)
+    if lfs.attributes(path, "mode") == "file" then
+        self:playAudioFile(path)
+        return true
+    end
+    local audio_dir = self.cache_dir .. "/audio"
+    if lfs.attributes(audio_dir, "mode") ~= "directory" then
+        util.makePath(audio_dir)
+    end
+    local tmp = path .. ".tmp"
+    Trapper:wrap(function()
+        local VoiceVox = require("voicevox")
+        local completed, ok, err = Trapper:dismissableRunInSubprocess(function()
+            -- The subprocess writes the file itself; only simple values cross
+            -- the process boundary.
+            local fetched, ferr = VoiceVox.fetch(opts, text, tmp)
+            return fetched == true, ferr and tostring(ferr) or nil
+        end, nil) -- invisible trap widget: any tap dismisses the wait
+        if not completed then
+            os.remove(tmp)
+            return
+        end
+        if not ok then
+            os.remove(tmp)
+            UIManager:show(InfoMessage:new{
+                text = T(_("VOICEVOX request failed: %1"), tostring(err or "unknown error")),
+                timeout = 3,
+            })
+            return
+        end
+        os.rename(tmp, path)
+        self:playAudioFile(path)
+    end)
+    return true
+end
+
+function Furigana:promptVoicevoxUrl(touchmenu_instance)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("VOICEVOX server URL"),
+        input = self:voicevoxOpts().url,
+        input_hint = "http://192.168.x.x:50021",
+        buttons = {{
+            {
+                text = _("Cancel"),
+                id = "close",
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Save"),
+                is_enter_default = true,
+                callback = function()
+                    local url = util.trim(dialog:getInputText() or "")
+                    G_reader_settings:saveSetting("furigana_voicevox_url", url ~= "" and url or nil)
+                    UIManager:close(dialog)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function Furigana:onCloseDocument()
+    -- Drop the kept Android MediaPlayer; audioplayer is package.loaded-cached,
+    -- so it outlives this plugin instance.
+    local ok, AudioPlayer = pcall(require, "audioplayer")
+    if ok and AudioPlayer.release then
+        AudioPlayer:release()
+    end
 end
 
 -- ------------------------------------------------------------------- toggle --
@@ -846,15 +1027,20 @@ function Furigana:clearCache()
     end
 
     local files, total = {}, 0
-    for f in lfs.dir(self.cache_dir) do
-        if f ~= "." and f ~= ".." then
-            local p = self.cache_dir .. "/" .. f
-            if lfs.attributes(p, "mode") == "file" and not keep[p] then
-                files[#files + 1] = p
-                total = total + (lfs.attributes(p, "size") or 0)
+    local function collect(dir)
+        if lfs.attributes(dir, "mode") ~= "directory" then return end
+        for f in lfs.dir(dir) do
+            if f ~= "." and f ~= ".." then
+                local p = dir .. "/" .. f
+                if lfs.attributes(p, "mode") == "file" and not keep[p] then
+                    files[#files + 1] = p
+                    total = total + (lfs.attributes(p, "size") or 0)
+                end
             end
         end
     end
+    collect(self.cache_dir)
+    collect(self.cache_dir .. "/audio") -- cached VOICEVOX word audio
 
     if #files == 0 then
         UIManager:show(InfoMessage:new{ text = _("The furigana cache is already empty.") })
@@ -940,6 +1126,66 @@ The readings are generated on-device; the first run on a book may take a little 
 This takes priority over the Japanese plugin's 'Tap a word to analyse it'; disable it here to get that back on single tap. 'Show furigana for word' can also be bound to any gesture.]]),
             },
             {
+                text = _("Word audio (VOICEVOX)"),
+                help_text = _([[Speak the tapped word using a self-hosted VOICEVOX engine (https://voicevox.hiroshiba.jp/). Run the engine on your PC and point the server URL at it; the device must reach it over the network (same Wi-Fi).
+
+Works together with or independently of the reading popup: enable either one, both, or neither. Each word is fetched once and cached.]]),
+                sub_item_table = {
+                    {
+                        text = _("Tap a word to hear it"),
+                        checked_func = function() return self:isTapAudioEnabled() end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            G_reader_settings:flipNilOrFalse("furigana_tap_audio")
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                        help_text = _([[Play the tapped word's audio. With the reading popup also enabled, you get both; with it disabled, tapping only speaks the word.
+
+Audio is fetched from the configured VOICEVOX server on first use and cached. Tapping elsewhere while audio is still loading cancels it and reveals the new word instead.]]),
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Server: %1"), self:voicevoxOpts().url)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:promptVoicevoxUrl(touchmenu_instance)
+                        end,
+                        help_text = _("The VOICEVOX engine's base URL, e.g. http://192.168.1.10:50021 (the engine listens on port 50021 by default)."),
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Speaker ID: %1"), self:voicevoxOpts().speaker)
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            local SpinWidget = require("ui/widget/spinwidget")
+                            local VoiceVox = require("voicevox")
+                            UIManager:show(SpinWidget:new{
+                                title_text = _("VOICEVOX speaker ID"),
+                                info_text = _("The voice/style id, as listed by the engine's /speakers endpoint. 3 = ずんだもん (normal)."),
+                                value = tonumber(self:voicevoxOpts().speaker) or VoiceVox.DEFAULT_SPEAKER,
+                                value_min = 0,
+                                value_max = 999,
+                                value_step = 1,
+                                value_hold_step = 10,
+                                default_value = VoiceVox.DEFAULT_SPEAKER,
+                                callback = function(spin)
+                                    G_reader_settings:saveSetting("furigana_voicevox_speaker", spin.value)
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            })
+                        end,
+                    },
+                    {
+                        text = _("Test audio (食べる)"),
+                        keep_menu_open = true,
+                        callback = function() self:speakText("食べる") end,
+                        help_text = _("Fetch and play a sample word from the configured server, to check the connection and the chosen speaker."),
+                    },
+                },
+            },
+            {
                 text = _("Reading level"),
                 sub_item_table_func = function() return self:genLevelItems() end,
                 help_text = _([[Choose which kanji get furigana, by Japanese school grade. "All kanji" annotates everything; higher levels show readings only for harder/less common kanji.
@@ -971,7 +1217,7 @@ Enable this to strip the book's embedded furigana first, so every reading is our
                 keep_menu_open = true,
                 separator = true,
                 callback = function() self:clearCache() end,
-                help_text = _("Delete cached annotated copies to free storage. The book you are currently reading with furigana is kept; everything else is removed and regenerated on demand."),
+                help_text = _("Delete cached annotated copies and cached word audio to free storage. The book you are currently reading with furigana is kept; everything else is removed and regenerated on demand."),
             },
         },
     }

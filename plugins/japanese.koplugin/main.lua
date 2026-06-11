@@ -639,6 +639,8 @@ function Japanese:registerDictButton()
         id = "japanese_analyse",
         text = _("Analyse (JA)"),
         conditional = true,
+        -- Shares a transient row with the furigana plugin's "Speak (JA)".
+        row_group = "ja_word_actions",
         show_func = function(dict_popup)
             if dict_popup.is_wiki then return false end
             local w = dict_popup.lookupword or dict_popup.word

@@ -33,13 +33,27 @@ end
 local shown = {} -- everything passed to UIManager:show
 local popups = {} -- ReadingPopup instances constructed
 
+local fake_fs = {} -- path -> "file"/"directory", for the lfs stub
+local fetches = {} -- recorded voicevox.fetch calls
+local fetch_result = { true, nil } -- scripted fetch outcome
+local played = {} -- recorded audioplayer plays
+local released = 0
+
 local stubs = {
     ["ui/widget/confirmbox"] = { new = function(_, o) return o end },
     ["datastorage"] = { getDataDir = function() return "/tmp/kofj_reveal" end },
     ["dispatcher"] = { registerAction = function() end },
     ["ui/event"] = { new = function(_, name, arg) return { name = name, arg = arg } end },
     ["ui/widget/infomessage"] = { new = function(_, o) o.__info = true; return o end },
-    ["ui/trapper"] = { wrap = function(_, fn) return fn() end, info = function() return true end, reset = function() end },
+    ["ui/trapper"] = {
+        wrap = function(_, fn) return fn() end,
+        info = function() return true end,
+        reset = function() end,
+        dismissableRunInSubprocess = function(_, task)
+            local a, b = task()
+            return true, a, b
+        end,
+    },
     ["ui/uimanager"] = {
         show = function(_, w) shown[#shown + 1] = w end,
         close = function() end,
@@ -47,10 +61,22 @@ local stubs = {
         scheduleIn = function() end,
     },
     ["ui/widget/container/widgetcontainer"] = WidgetContainer,
-    ["libs/libkoreader-lfs"] = { attributes = function() return nil end, dir = function() return function() end end },
+    ["libs/libkoreader-lfs"] = {
+        attributes = function(p, what)
+            local mode = fake_fs[p]
+            if not mode then return nil end
+            if what == "mode" then return mode end
+            return { mode = mode }
+        end,
+        dir = function() return function() end end,
+    },
     ["logger"] = { dbg = function() end, info = function() end, warn = function() end, err = function() end },
     ["util"] = {
         makePath = function() end,
+        trim = function(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end,
+        cleanupSelectedText = function(s)
+            return (s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+        end,
         -- Kana/kanji both start with bytes 0xE3..0xE9 in UTF-8; good enough here.
         hasCJKChar = function(s) return s:find("[\227-\233]") ~= nil end,
     },
@@ -63,6 +89,21 @@ local stubs = {
             popups[#popups + 1] = o
             return o
         end,
+    },
+    ["voicevox"] = {
+        DEFAULT_URL = "http://127.0.0.1:50021",
+        DEFAULT_SPEAKER = 3,
+        fetch = function(opts, word, out_path)
+            fetches[#fetches + 1] = { opts = opts, word = word, out_path = out_path }
+            return fetch_result[1], fetch_result[2]
+        end,
+    },
+    ["audioplayer"] = {
+        play = function(_, path)
+            played[#played + 1] = path
+            return true
+        end,
+        release = function() released = released + 1 end,
     },
 }
 for name, mod in pairs(stubs) do
@@ -233,6 +274,129 @@ popups = {}
 check(furi:revealAtPos({ x = 5, y = 6 }) == true and popups[1]
     and popups[1].text == "食べ（たべ）",
     "no Japanese plugin: tapped character's token is still shown")
+
+-- 11) Word audio (VOICEVOX) -------------------------------------------------
+doc.word_at_pos = { word = "食", pos0 = "xp0", pos1 = "xp1" }
+furi.ui.japanese = { expandWord = function() return "食べた" end }
+
+-- Both toggles off: the tap zone declines without looking anything up.
+settings_store["furigana_tap_reveal"] = false
+settings_store["furigana_tap_audio"] = nil
+local q_before = doc.word_queries
+check(furi:onTapReveal({ pos = { x = 5, y = 6 } }) == false and doc.word_queries == q_before,
+    "popup and audio both off: tap declines untouched")
+
+-- Audio only: fetch with the expanded word, play the cached wav, no popup.
+settings_store["furigana_tap_audio"] = true
+popups, fetches, played = {}, {}, {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true, "audio only: tap is consumed")
+check(#popups == 0, "audio only: no popup")
+check(#fetches == 1 and fetches[1].word == "食べた"
+    and fetches[1].opts.url == "http://127.0.0.1:50021" and fetches[1].opts.speaker == 3,
+    "audio only: VOICEVOX queried with the expanded word and configured opts")
+local cache_path = furi:audioCachePathFor(furi:voicevoxOpts(), "食べた")
+check(fetches[1].out_path == cache_path .. ".tmp" and #played == 1 and played[1] == cache_path,
+    "fetched to a .tmp then played from the cache path")
+
+-- Cache hit: plays immediately, no fetch.
+fake_fs[cache_path] = "file"
+fetches, played = {}, {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #fetches == 0
+    and #played == 1 and played[1] == cache_path,
+    "cached word: plays immediately without fetching")
+fake_fs[cache_path] = nil
+
+-- Kana-only word: no reading popup possible, but audio still speaks it.
+doc.word_at_pos = { word = "ひらがな", pos0 = "xp0", pos1 = "xp1" }
+furi.ui.japanese = nil
+fetches, popups = {}, {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #fetches == 1
+    and fetches[1].word == "ひらがな" and #popups == 0,
+    "kana-only word with audio on: spoken, no popup")
+
+-- Both on: popup and audio together.
+settings_store["furigana_tap_reveal"] = nil -- default on
+doc.word_at_pos = { word = "風", pos0 = "xp0", pos1 = "xp1" }
+doc.sentence = { text = "風が吹く。", pos0 = "s0" }
+doc.prefix = ""
+popups, fetches = {}, {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #popups == 1
+    and popups[1].text == "風（かぜ）" and #fetches == 1 and fetches[1].word == "風",
+    "popup and audio both enabled: both happen")
+
+-- Fetch failure: error message, nothing played (the reading popup still shows).
+fetch_result = { false, "connection refused" }
+fetches, played, shown = {}, {}, {}
+local revealed = furi:revealAtPos({ x = 5, y = 6 })
+local error_shown = false
+for _, w in ipairs(shown) do
+    if w.__info and w.text:match("VOICEVOX") then error_shown = true end
+end
+check(revealed == true and #played == 0 and error_shown,
+    "fetch failure: user is told, nothing plays")
+fetch_result = { true, nil }
+
+-- Explicit gesture forces the popup even with the single-tap toggle off.
+settings_store["furigana_tap_reveal"] = false
+settings_store["furigana_tap_audio"] = nil
+popups = {}
+check(furi:onShowWordFurigana({ pos = { x = 5, y = 6 } }) == true and #popups == 1,
+    "explicit gesture shows the popup despite the tap toggle being off")
+settings_store["furigana_tap_reveal"] = nil
+
+-- Closing the document releases the kept player.
+released = 0
+furi:onCloseDocument()
+check(released == 1, "closing the document releases the audio player")
+
+-- 12) Speak buttons (highlight dialog + dictionary window) -------------------
+local highlight_items = {}
+local dict_specs = {}
+furi.ui.highlight = {
+    addToHighlightDialog = function(_, idx, fn) highlight_items[idx] = fn end,
+}
+furi.ui.dictionary = {
+    addToDictButtons = function(_, spec) dict_specs[spec.id] = spec end,
+}
+furi:registerSpeakButtons()
+
+-- Highlight dialog entry: shown for Japanese selections, speaks cleaned text.
+local item_fn = highlight_items["12_a_voicevox_speak"]
+check(item_fn ~= nil, "a Speak entry is registered in the highlight dialog")
+local closed = 0
+local this = {
+    selected_text = { text = "  毎日\n食べた。 " },
+    onClose = function() closed = closed + 1 end,
+}
+local item = item_fn(this)
+check(item.show_in_highlight_dialog_func() == true,
+    "highlight dialog: shown for a Japanese selection")
+-- Audio toggle is off here: the Speak button must work regardless.
+settings_store["furigana_tap_audio"] = nil
+fetches = {}
+item.callback()
+check(closed == 1 and #fetches == 1 and fetches[1].word == "毎日 食べた。",
+    "highlight dialog Speak: closes the dialog and speaks the cleaned selection: "
+        .. (fetches[1] and fetches[1].word or "?"))
+this.selected_text.text = "english only"
+check(item_fn(this).show_in_highlight_dialog_func() == false,
+    "highlight dialog: hidden for non-Japanese selections")
+
+-- Dictionary window button: conditional, shares the analyse row, speaks the
+-- originally selected form.
+local spec = dict_specs["furigana_speak"]
+check(spec ~= nil and spec.conditional == true and spec.row_group == "ja_word_actions",
+    "dictionary Speak button is transient and shares the JA actions row")
+check(spec.show_func({ is_wiki = true, word = "食べた" }) == false,
+    "dictionary Speak: hidden on wiki windows")
+check(spec.show_func({ word = "hello" }) == false,
+    "dictionary Speak: hidden for non-Japanese words")
+check(spec.show_func({ word = "食べた" }) == true,
+    "dictionary Speak: shown for Japanese words")
+fetches = {}
+spec.callback({ word = "食べた", lookupword = "食べる" })
+check(#fetches == 1 and fetches[1].word == "食べた",
+    "dictionary Speak: speaks the selected form, not the headword")
 
 print(failures == 0 and "\nALL TESTS PASSED" or ("\n" .. failures .. " TEST(S) FAILED"))
 os.exit(failures == 0 and 0 or 1)
