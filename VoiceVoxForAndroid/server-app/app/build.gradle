@@ -1,0 +1,58 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.saibotix.voicevoxserver'
+    compileSdk 30
+    buildToolsVersion '34.0.0'
+
+    defaultConfig {
+        applicationId 'com.saibotix.voicevoxserver'
+        minSdk 26
+        targetSdk 28
+        versionCode 1
+        versionName '0.1.0 (core 0.16.4)'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    signingConfigs {
+        release {
+            // Dev keystore committed next to the project so host and container
+            // builds sign identically and upgrades install in place.
+            storeFile rootProject.file('signing/voicevox.keystore')
+            storePassword 'voicevox-server'
+            keyAlias 'voicevox'
+            keyPassword 'voicevox-server'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    packagingOptions {
+        // Extract .so files to disk so the Rust side can dlopen
+        // libvoicevox_onnxruntime.so by name.
+        jniLibs { useLegacyPackaging = true }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation 'jp.hiroshiba.voicevoxcore:voicevoxcore-android:0.16.4'
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    implementation 'com.google.code.gson:gson:2.10.1'
+}

@@ -1,0 +1,25 @@
+# upstream checkouts (own .git; kept for reference, not committable as files)
+voicevox/
+voicevox_core/
+voicevox_engine/
+
+# downloaded release artifacts (restored by server-app/fetch-artifacts.sh)
+artifacts/
+
+# dev signing key must stay committed (overrides the repo root *.keystore
+# rule) so builds from any machine upgrade in place on-device
+!server-app/signing/voicevox.keystore
+
+# staged big binaries + build output
+server-app/local-maven/
+server-app/.gradle/
+server-app/build/
+server-app/app/build/
+server-app/local.properties
+server-app/app/src/main/assets/open_jtalk_dic_utf_8-1.11/
+server-app/app/src/main/assets/vvms/
+server-app/app/src/main/assets/legal/
+server-app/app/src/main/jniLibs/
+server-app/desktop-test/libs/
+server-app/desktop-test/work/
+server-app/desktop-test/out/

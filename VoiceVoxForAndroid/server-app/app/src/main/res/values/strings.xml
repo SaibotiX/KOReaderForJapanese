@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VOICEVOX Server</string>
+    <string name="start_server">Start server</string>
+    <string name="stop_server">Stop server</string>
+    <string name="autostart">Start automatically after boot</string>
+    <string name="battery_exempt_request">Disable battery optimization…</string>
+    <string name="battery_exempt_ok">Battery optimization already disabled ✓</string>
+    <string name="status_prefix">Status: </string>
+    <string name="credits">Powered by VOICEVOX (voicevox.hiroshiba.jp).
+Generated audio requires credit, e.g. “VOICEVOX:ずんだもん”.
+Voice model terms: see Android/data/com.saibotix.voicevoxserver/files/legal/.
+Extra voices: copy more .vvm files into /sdcard/voicevox/vvms/ (any file
+manager, survives reinstalls) and restart the server. Models are loaded on
+first use; the most recent two stay in RAM.</string>
+</resources>

@@ -1,0 +1,20 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        // unzipped java_packages.zip from the voicevox_core release (fetch-artifacts.sh)
+        maven { url = new File(settingsDir, "local-maven").toURI() }
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "voicevox-server"
+include ":app"
