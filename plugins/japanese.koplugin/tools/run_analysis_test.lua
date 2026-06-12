@@ -77,6 +77,41 @@ case("静かじゃない", "静か", "na-adjective", "Non-past negative")
 
 -- strip_html / window_text.
 check("strip_html", Analysis.strip_html("<b>to eat</b><br>also: &amp; etc."), "to eat\nalso: & etc.")
+-- Block-structured (StarDict "h"-type) entries must not collapse into a blob.
+check("strip_html.blocks",
+    Analysis.strip_html('<div class="m">①意味その一</div><div class="m">②意味その二</div><p>例文。</p>'),
+    "①意味その一\n②意味その二\n例文。")
+check("strip_html.list",
+    Analysis.strip_html("<ol><li>to eat</li><li>to live on</li></ol>"),
+    "• to eat\n• to live on")
+-- <hr> dividers act as line breaks, in all their spellings.
+check("strip_html.hr",
+    Analysis.strip_html("意味その一<hr>意味その二"), "意味その一\n意味その二")
+check("strip_html.hr_variants",
+    Analysis.strip_html("first<HR>second<hr/>third<hr class=\"sep\" />fourth"),
+    "first\nsecond\nthird\nfourth")
+check("strip_html.hr_between_blocks",
+    Analysis.strip_html("<div>意味</div><hr><div>例文</div>"), "意味\n例文")
+-- &nbsp; (and friends) must decode, not show literally; indentation survives.
+check("strip_html.nbsp",
+    Analysis.strip_html("見出し<br>&nbsp;&nbsp;例文です&hellip;"),
+    "見出し\n  例文です…")
+check("strip_html.numeric_entities",
+    Analysis.strip_html("&#12354;&#x3042; &#65;"), "ああ A")
+check("strip_html.amp_once", Analysis.strip_html("&amp;lt;tag&amp;gt;"), "&lt;tag&gt;")
+-- Ruby readings become parentheses, <rp> fallbacks are dropped.
+check("strip_html.ruby",
+    Analysis.strip_html("<ruby>食<rp>(</rp><rt>た</rt><rp>)</rp></ruby>べる"),
+    "食（た）べる")
+-- Invisible blocks vanish; plain-text definitions keep their own newlines.
+check("strip_html.style",
+    Analysis.strip_html("<style>div { color: red; }</style>meaning"), "meaning")
+check("strip_html.plain_text",
+    Analysis.strip_html("first line\nsecond line"), "first line\nsecond line")
+check("strip_html.html_compact",
+    Analysis.strip_html("<p>one</p>\n\n\n<p>two</p>"), "one\ntwo")
+check("strip_html.plain_blank_lines",
+    Analysis.strip_html("one\n\n\n\ntwo"), "one\n\ntwo")
 
 -- furigana_label: extract the kana reading from the furigana plugin's ruby HTML.
 check("furigana.kanji", Analysis.furigana_label("食べる", "<ruby>食<rt>た</rt></ruby>べる"), "食べる (たべる)")

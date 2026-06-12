@@ -141,12 +141,92 @@ end
 
 --- Reduce a StarDict/sdcv definition to readable plain text for a TextViewer
 -- (strip tags, turn <br> into newlines, decode the common entities).
+-- Encode a Unicode codepoint as UTF-8 (for numeric character references;
+-- stock LuaJIT has no utf8.char).
+local function utf8_char(cp)
+    if not cp or cp >= 0x110000 then return "" end
+    if cp < 0x80 then
+        return string.char(cp)
+    elseif cp < 0x800 then
+        return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
+    elseif cp < 0x10000 then
+        return string.char(0xE0 + math.floor(cp / 0x1000),
+            0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+    end
+    return string.char(0xF0 + math.floor(cp / 0x40000),
+        0x80 + math.floor(cp / 0x1000) % 0x40,
+        0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+end
+
+-- Common named entities seen in StarDict definitions. &nbsp; becomes a plain
+-- space (runs of them are how many dictionaries indent, and we don't collapse
+-- horizontal whitespace below, so indentation survives). Decoded in a single
+-- gsub pass, so "&amp;lt;" correctly yields "&lt;" without double-decoding.
+local NAMED_ENTITIES = {
+    nbsp = " ", amp = "&", lt = "<", gt = ">", quot = '"', apos = "'",
+    hellip = "…", mdash = "—", ndash = "–", middot = "·", bull = "•",
+    lsquo = "‘", rsquo = "’", ldquo = "“", rdquo = "”", deg = "°", copy = "©",
+}
+
+-- Tags whose boundaries break the text flow: stripping them must leave a
+-- newline behind, or structured (HTML-type) dictionary entries collapse into
+-- one solid blob.
+local BLOCK_TAGS = {
+    p = true, div = true, ul = true, ol = true, dl = true, dt = true, dd = true,
+    table = true, tr = true, blockquote = true, pre = true, section = true,
+    article = true, header = true, footer = true,
+    h1 = true, h2 = true, h3 = true, h4 = true, h5 = true, h6 = true,
+}
+
+--- Convert a dictionary definition (plain text or StarDict "h"-type HTML) to
+-- readable plain text: block tags become line breaks, list items bullets,
+-- ruby readings parentheses; entities (named and numeric) are decoded in
+-- either case. HTML entries are rendered compactly (no blank lines: adjacent
+-- block boundaries fold into one break); plain-text entries pass through with
+-- their own line structure intact.
 function Analysis.strip_html(s)
     if not s or s == "" then return "" end
-    s = s:gsub("<%s*[bB][rR]%s*/?>", "\n")
-    s = s:gsub("<[^>]+>", "")
-    s = s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
-        :gsub("&#39;", "'"):gsub("&apos;", "'"):gsub("&amp;", "&")
+    s = s:gsub("\r\n?", "\n")
+    local is_html = s:find("<%s*/?%s*%a[^>]*>") ~= nil
+    if is_html then
+        -- Drop comments and invisible style/script blocks wholesale.
+        s = s:gsub("<!%-%-.-%-%->", "")
+        s = s:gsub("<%s*[sS][tT][yY][lL][eE][^>]*>.-<%s*/%s*[sS][tT][yY][lL][eE]%s*>", "")
+        s = s:gsub("<%s*[sS][cC][rR][iI][pP][tT][^>]*>.-<%s*/%s*[sS][cC][rR][iI][pP][tT]%s*>", "")
+        -- Ruby annotations: keep the reading, parenthesized after its base;
+        -- drop <rp> fallback parentheses (they would double up).
+        s = s:gsub("<%s*[rR][pP][^>]*>.-<%s*/%s*[rR][pP]%s*>", "")
+        s = s:gsub("<%s*[rR][tT][^>]*>(.-)<%s*/%s*[rR][tT]%s*>", "（%1）")
+        -- All remaining tags in one pass: structural ones leave breaks or
+        -- bullets behind, inline ones vanish.
+        s = s:gsub("<%s*(/?)%s*([%a][%w]*)[^>]*>", function(slash, name)
+            local n = name:lower()
+            if n == "br" or n == "hr" then return "\n" end
+            if n == "li" then return slash == "/" and "" or "\n• " end
+            if BLOCK_TAGS[n] then return "\n" end
+            return ""
+        end)
+    end
+    -- Entities: numeric first, then named (&amp; among them; single pass, so
+    -- its output is never re-decoded). Plain-text dictionaries carry these too.
+    s = s:gsub("&#[xX](%x+);", function(h) return utf8_char(tonumber(h, 16)) end)
+    s = s:gsub("&#(%d+);", function(d) return utf8_char(tonumber(d)) end)
+    s = s:gsub("&(%a+);", NAMED_ENTITIES)
+    -- Tidy whitespace. Horizontal runs are kept (indentation), trailing
+    -- spaces before a break are not.
+    s = s:gsub("[ \t]+\n", "\n")
+    if is_html then
+        -- Fold newline runs (e.g. from </div><div>) into single line breaks:
+        -- senses read best single-spaced in the popup.
+        local prev
+        repeat
+            prev = s
+            s = s:gsub("\n[ \t]*\n", "\n")
+        until s == prev
+    else
+        -- Plain text: keep deliberate blank lines, just cap them at one.
+        s = s:gsub("\n\n\n+", "\n\n")
+    end
     s = s:gsub("^%s+", ""):gsub("%s+$", "")
     return s
 end
