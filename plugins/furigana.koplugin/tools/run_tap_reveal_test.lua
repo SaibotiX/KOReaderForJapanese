@@ -398,5 +398,189 @@ spec.callback({ word = "食べた", lookupword = "食べる" })
 check(#fetches == 1 and fetches[1].word == "食べた",
     "dictionary Speak: speaks the selected form, not the headword")
 
+-- 13) Tap display modes: dictionary entry / translation ----------------------
+doc.word_at_pos = { word = "食", pos0 = "xp0", pos1 = "xp1", sbox = { x = 1, y = 2, w = 3, h = 4 } }
+doc.sentence = { text = "毎日食べた。", pos0 = "s0" }
+doc.prefix = "毎日"
+furi.ui.japanese = { expandWord = function() return "食べた" end }
+
+-- Dictionary mode: the expanded word goes through onLookupWord, restricted to
+-- the chosen dictionary, anchored at the word's box; no reading popup.
+local lookups = {}
+furi.ui.dictionary.onLookupWord = function(_, word, is_sane, boxes, highlight, link, cb, opts)
+    lookups[#lookups + 1] = { word = word, boxes = boxes, opts = opts }
+    return true
+end
+furi.ui.dictionary.enabled_dict_names = { "JMdict", "大辞林" }
+settings_store["furigana_tap_display"] = "dict"
+settings_store["furigana_tap_dict"] = "JMdict"
+popups, fetches = {}, {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #popups == 0,
+    "dict mode: tap consumed, no reading popup")
+check(#lookups == 1 and lookups[1].word == "食べた"
+        and lookups[1].opts and #lookups[1].opts.dict_names == 1
+        and lookups[1].opts.dict_names[1] == "JMdict",
+    "dict mode: expanded word looked up in the chosen dictionary only")
+check(lookups[1].boxes and lookups[1].boxes[1].x == 1 and lookups[1].boxes[1].y == 2,
+    "dict mode: lookup window anchored at the word's screen box")
+
+-- Without a chosen dictionary, all enabled dictionaries are searched.
+settings_store["furigana_tap_dict"] = nil
+lookups = {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #lookups == 1
+        and (lookups[1].opts == nil or lookups[1].opts.dict_names == nil),
+    "dict mode without a chosen dictionary searches them all")
+
+-- Word audio still plays alongside the dictionary window.
+settings_store["furigana_tap_audio"] = true
+fetches, lookups = {}, {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #fetches == 1 and #lookups == 1,
+    "dict mode: word audio plays alongside the lookup")
+settings_store["furigana_tap_audio"] = nil
+
+-- Translate mode: the built-in translator gets the expanded word.
+local translations = {}
+package.preload["ui/translator"] = function()
+    return {
+        showTranslation = function(_, text, detailed)
+            translations[#translations + 1] = { text = text, detailed = detailed }
+        end,
+    }
+end
+settings_store["furigana_tap_display"] = "translate"
+popups = {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #popups == 0
+        and #translations == 1 and translations[1].text == "食べた"
+        and translations[1].detailed == true,
+    "translate mode: expanded word goes to the translator's detailed view")
+
+-- The explicit gesture still forces the reading popup, whatever the mode.
+popups = {}
+check(furi:onShowWordFurigana({ pos = { x = 5, y = 6 } }) == true and #popups == 1,
+    "explicit gesture shows the reading popup even in translate mode")
+
+-- Reading popup + translation: the popup appears immediately with the
+-- reading, then is swapped for a two-line version once the translation lands.
+local tr_stub = require("ui/translator")
+local word_translations = {}
+tr_stub.translate = function(_, text, target, source)
+    word_translations[#word_translations + 1] = { text = text, target = target, source = source }
+    return ({ ["食べた"] = "ate", ["ひらがな"] = "hiragana" })[text]
+end
+settings_store["furigana_tap_display"] = "popup_translate"
+doc.sentence = { text = "毎日食べた。", pos0 = "s0" }
+doc.prefix = "毎日"
+popups = {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #popups == 2,
+    "popup+translation: popup shown, then swapped when the translation lands")
+check(popups[1].text == "食べ（たべ）た",
+    "popup+translation: the reading appears immediately (no waiting on the network)")
+check(popups[2].text == "食べ（たべ）た\nate",
+    "popup+translation: layout is reading on top, bare translation below: "
+        .. tostring(popups[2].text))
+check(word_translations[1].text == "食べた" and word_translations[1].target == "en"
+        and word_translations[1].source == "ja",
+    "popup+translation: translates the expanded word ja→en")
+
+-- Session cache: a second tap on the same word shows both lines at once.
+popups, word_translations = {}, {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #popups == 1
+        and popups[1].text == "食べ（たべ）た\nate" and #word_translations == 0,
+    "popup+translation: cached translation shows in one go, no refetch")
+
+-- Kana-only words have no reading line, but the translation still shows.
+doc.word_at_pos = { word = "ひらがな", pos0 = "xp0", pos1 = "xp1" }
+furi.ui.japanese = nil
+popups = {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #popups == 2
+        and popups[2].text == "ひらがな\nhiragana",
+    "popup+translation: kana-only word gets word + translation")
+
+-- Translation unavailable (offline / engine error): reading-only popup stays.
+tr_stub.translate = function() return nil end
+doc.word_at_pos = { word = "風", pos0 = "xp0", pos1 = "xp1" }
+doc.sentence = { text = "風が吹く。", pos0 = "s0" }
+doc.prefix = ""
+popups = {}
+check(furi:revealAtPos({ x = 5, y = 6 }) == true and #popups == 1
+        and popups[1].text == "風（かぜ）",
+    "popup+translation: failed translation keeps the reading-only popup")
+doc.word_at_pos = { word = "食", pos0 = "xp0", pos1 = "xp1", sbox = { x = 1, y = 2, w = 3, h = 4 } }
+furi.ui.japanese = { expandWord = function() return "食べた" end }
+
+-- Legacy migration: installs from before the mode existed kept a boolean.
+settings_store["furigana_tap_display"] = nil
+settings_store["furigana_tap_reveal"] = false
+check(furi:getTapDisplayMode() == "none", "legacy tap_reveal=false migrates to 'none'")
+settings_store["furigana_tap_reveal"] = nil
+check(furi:getTapDisplayMode() == "popup", "the default mode is the reading popup")
+
+-- 14) Menu sanity: build the whole menu and evaluate every dynamic field the
+-- way TouchMenu would when the user opens it. (A "for _, m" loop shadowing
+-- gettext's _ inside a text_func once crashed KOReader right here.)
+local menu_items = {}
+furi:addToMainMenu(menu_items)
+check(menu_items.furigana_annotation ~= nil
+        and type(menu_items.furigana_annotation.sub_item_table) == "table",
+    "the furigana menu registers itself")
+
+local menu_errors = {}
+local visited = 0
+local function walk(items, where)
+    for i, item in ipairs(items) do
+        visited = visited + 1
+        local name = tostring(item.text or i)
+        local function try(field, fn)
+            if type(fn) ~= "function" then return nil end
+            local ok, res = pcall(fn)
+            if not ok then
+                menu_errors[#menu_errors + 1] = where .. "/" .. name .. "." .. field
+                    .. ": " .. tostring(res)
+                return nil
+            end
+            return res
+        end
+        local txt = try("text_func", item.text_func)
+        if type(txt) == "string" then name = txt end
+        try("enabled_func", item.enabled_func)
+        try("checked_func", item.checked_func)
+        local sub = item.sub_item_table or try("sub_item_table_func", item.sub_item_table_func)
+        if type(sub) == "table" then
+            walk(sub, where .. "/" .. name)
+        end
+    end
+end
+walk(menu_items.furigana_annotation.sub_item_table, "furigana")
+check(#menu_errors == 0, "every menu *_func evaluates cleanly"
+    .. (#menu_errors > 0 and (":\n    " .. table.concat(menu_errors, "\n    ")) or ""))
+check(visited >= 25, "the menu walk visited the whole tree: " .. visited .. " items")
+
+-- 15) The position-restore match chooser builds its rows without errors
+-- (same gettext-shadowing hazard inside its row loop).
+local kvpages = {}
+package.preload["ui/widget/keyvaluepage"] = function()
+    return { new = function(_, o) kvpages[#kvpages + 1] = o; return o end }
+end
+local gone_to = {}
+local new_ui = {
+    document = {
+        getPageFromXPointer = function(_, xp) return xp == "xpA" and 3 or 7 end,
+        getPageCount = function() return 10 end,
+        getTextFromXPointers = function() return "ある日の暮方の事である。" end,
+    },
+    rolling = { onGotoXPointer = function(_, xp) gone_to[#gone_to + 1] = xp end },
+}
+local ok_chooser, chooser_err = pcall(function()
+    furi:showMatchChooser(new_ui, {
+        { start = "xpA", ["end"] = "xpB" },
+        { start = "xpC", ["end"] = "xpD" },
+    }, 0.3)
+end)
+check(ok_chooser, "match chooser builds without errors: " .. tostring(chooser_err))
+check(#kvpages == 1 and #kvpages[1].kv_pairs == 2,
+    "match chooser lists every candidate position")
+kvpages[1].kv_pairs[1].callback()
+check(gone_to[1] == "xpA", "tapping a candidate jumps to its position")
+
 print(failures == 0 and "\nALL TESTS PASSED" or ("\n" .. failures .. " TEST(S) FAILED"))
 os.exit(failures == 0 and 0 or 1)

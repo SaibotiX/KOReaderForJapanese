@@ -18,6 +18,19 @@ local VoiceVox = {}
 VoiceVox.DEFAULT_URL = "http://127.0.0.1:50021"
 VoiceVox.DEFAULT_SPEAKER = 3 -- ずんだもん (ノーマル), the engine's default poster child
 
+-- audio_query is near-instant on any healthy engine, so it doubles as the
+-- reachability check: keep it snappy so a dead/wrong server fails fast.
+VoiceVox.QUERY_BLOCK_TIMEOUT = 20
+VoiceVox.QUERY_TOTAL_TIMEOUT = 60
+-- synthesis computes the whole WAV before sending the first byte, so on slow
+-- (on-device) engines a long sentence/paragraph easily exceeds any "normal"
+-- socket timeout while the connection sits idle. Once audio_query proved the
+-- server alive, let synthesis run to completion: these are deliberately huge
+-- (the fetch runs in a dismissable/background subprocess, so a stuck job can
+-- always be cancelled by the user or its owner).
+VoiceVox.SYNTH_BLOCK_TIMEOUT = 600
+VoiceVox.SYNTH_TOTAL_TIMEOUT = 3600
+
 --- Percent-encode a UTF-8 string for use in a query parameter.
 function VoiceVox.urlencode(s)
     return (s:gsub("[^%w%-%._~]", function(c)
@@ -39,13 +52,13 @@ function VoiceVox.fetch(opts, text, out_path, requester)
     end
     local speaker = tonumber(opts.speaker) or VoiceVox.DEFAULT_SPEAKER
 
-    local function post(url, body)
+    local function post(url, body, block_timeout, total_timeout)
         local sink = {}
         local headers = { ["Content-Length"] = tostring(body and #body or 0) }
         if body then
             headers["Content-Type"] = "application/json"
         end
-        socketutil:set_timeout(10, 30)
+        socketutil:set_timeout(block_timeout, total_timeout)
         -- Table-form request returns (1, code, headers, status) on success,
         -- or (nil, error_message) on transport errors.
         local ok, res, code = pcall(requester.request, {
@@ -70,12 +83,15 @@ function VoiceVox.fetch(opts, text, out_path, requester)
 
     local query_url = ("%s/audio_query?speaker=%d&text=%s"):format(
         base, speaker, VoiceVox.urlencode(text))
-    local query_json, qerr = post(query_url, nil)
+    local query_json, qerr = post(query_url, nil,
+        VoiceVox.QUERY_BLOCK_TIMEOUT, VoiceVox.QUERY_TOTAL_TIMEOUT)
     if not query_json or query_json == "" then
         return nil, "audio_query failed: " .. tostring(qerr or "empty response")
     end
 
-    local wav, serr = post(("%s/synthesis?speaker=%d"):format(base, speaker), query_json)
+    local wav, serr = post(("%s/synthesis?speaker=%d"):format(base, speaker), query_json,
+        opts.synth_block_timeout or VoiceVox.SYNTH_BLOCK_TIMEOUT,
+        opts.synth_total_timeout or VoiceVox.SYNTH_TOTAL_TIMEOUT)
     if not wav or wav == "" then
         return nil, "synthesis failed: " .. tostring(serr or "empty response")
     end

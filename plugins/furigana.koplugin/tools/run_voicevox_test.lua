@@ -13,8 +13,14 @@ package.preload["ltn12"] = function()
         sink = { table = function(t) return t end },
     }
 end
+local timeout_calls = {}
 package.preload["socketutil"] = function()
-    return { set_timeout = function() end, reset_timeout = function() end }
+    return {
+        set_timeout = function(_, block, total)
+            timeout_calls[#timeout_calls + 1] = { block, total }
+        end,
+        reset_timeout = function() end,
+    }
 end
 
 local VoiceVox = require("voicevox")
@@ -84,6 +90,30 @@ local f = io.open(out, "rb")
 local written = f:read("*a")
 f:close()
 check(written == "RIFFwavbytes", "WAV bytes written to the output file")
+os.remove(out)
+
+-- Timeouts: audio_query stays snappy (it is the reachability check), while
+-- synthesis must be allowed to run to completion — the engine computes the
+-- whole WAV before sending a byte, so an idle socket is NOT a dead one.
+check(#timeout_calls == 2
+        and timeout_calls[1][1] == VoiceVox.QUERY_BLOCK_TIMEOUT
+        and timeout_calls[1][2] == VoiceVox.QUERY_TOTAL_TIMEOUT,
+    "audio_query uses the short reachability timeouts")
+check(timeout_calls[2][1] == VoiceVox.SYNTH_BLOCK_TIMEOUT
+        and timeout_calls[2][2] == VoiceVox.SYNTH_TOTAL_TIMEOUT,
+    "synthesis uses the huge run-to-completion timeouts")
+check(VoiceVox.SYNTH_BLOCK_TIMEOUT >= 600,
+    "synthesis block timeout is at least 10 minutes (no premature 'timeout' error)")
+
+-- Background workers may override the synthesis timeouts per request.
+timeout_calls = {}
+VoiceVox.fetch({ url = "http://x", speaker = 1,
+    synth_block_timeout = 33, synth_total_timeout = 99 }, "詞", out, make_requester({
+    { code = 200, body = "{}" },
+    { code = 200, body = "RIFF" },
+}))
+check(timeout_calls[2][1] == 33 and timeout_calls[2][2] == 99,
+    "opts can override the synthesis timeouts (precache worker)")
 os.remove(out)
 
 -- Error paths.

@@ -24,9 +24,11 @@ local Input = Device.input
 local Screen = Device.screen
 
 local ReadingPopup = InputContainer:extend{
-    text = nil,         -- reading text, e.g. 食（た）べた
+    text = nil,         -- reading text, e.g. 食（た）べた; may be multi-line
+                        -- (reading on the first line, translation below)
     anchor_box = nil,   -- Geom (screen) of the tapped word; nil centers the popup
     tap_callback = nil, -- called after closing when the popup body is tapped
+    close_callback = nil, -- called when the popup is closed/replaced
 }
 
 function ReadingPopup:init()
@@ -46,16 +48,38 @@ function ReadingPopup:init()
             SwipeDismiss = { GestureRange:new{ ges = "swipe", range = fullscreen } },
         }
     end
+    local face = Font:getFace("cfont", G_reader_settings:readSetting("dict_font_size") or 20)
+    local max_width = math.floor(Screen:getWidth() * 0.9)
+    local content
+    if self.text:find("\n", 1, true) then
+        -- Multi-line (reading + translation): TextWidget renders one line
+        -- only, so use a TextBoxWidget sized to the longest line to keep the
+        -- bubble snug around the text.
+        local widest = 0
+        for line in self.text:gmatch("[^\n]+") do
+            local w = TextWidget:new{ text = line, face = face }
+            widest = math.max(widest, w:getSize().w)
+            w:free()
+        end
+        local TextBoxWidget = require("ui/widget/textboxwidget")
+        content = TextBoxWidget:new{
+            text = self.text,
+            face = face,
+            width = math.min(widest, max_width),
+        }
+    else
+        content = TextWidget:new{
+            text = self.text,
+            face = face,
+            max_width = max_width,
+        }
+    end
     self.frame = FrameContainer:new{
         background = Blitbuffer.COLOR_WHITE,
         bordersize = Size.border.window,
         radius = Size.radius.window,
         padding = Size.padding.default,
-        TextWidget:new{
-            text = self.text,
-            face = Font:getFace("cfont", G_reader_settings:readSetting("dict_font_size") or 20),
-            max_width = math.floor(Screen:getWidth() * 0.9),
-        },
+        content,
     }
     self.movable = MovableContainer:new{
         unmovable = true, -- a furigana bubble is not a window to drag around
@@ -81,6 +105,9 @@ function ReadingPopup:onCloseWidget()
     UIManager:setDirty(nil, function()
         return "ui", self.movable.dimen
     end)
+    if self.close_callback then
+        self.close_callback()
+    end
 end
 
 function ReadingPopup:onClose()

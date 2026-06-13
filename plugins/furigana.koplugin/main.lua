@@ -108,6 +108,12 @@ function Furigana:onDispatcherRegisterActions()
         title = _("Show furigana for word"),
         reader = true,
     })
+    Dispatcher:registerAction("furigana_autoread_toggle", {
+        category = "none",
+        event = "ToggleAutoRead",
+        title = _("Auto reader (VOICEVOX)"),
+        reader = true,
+    })
 end
 
 -- On opening a plain book, if it was last read with furigana, reopen the cached
@@ -279,8 +285,24 @@ end
 -- generated on the fly from the tokenizer — the book file is never touched, so
 -- this works without generating the annotated copy.
 
-function Furigana:isTapRevealEnabled()
-    return G_reader_settings:nilOrTrue("furigana_tap_reveal")
+--- What a short tap on a word displays: "popup" (the reading popup, default),
+-- "dict" (the dictionary window, optionally restricted to one dictionary),
+-- "translate" (the built-in Google-Translate window) or "none" (nothing —
+-- tap audio may still play). Installs from before this mode existed only
+-- stored the popup on/off toggle; honor it as the default.
+function Furigana:getTapDisplayMode()
+    local mode = G_reader_settings:readSetting("furigana_tap_display")
+    if mode == nil then
+        mode = G_reader_settings:readSetting("furigana_tap_reveal") == false
+            and "none" or "popup"
+    end
+    return mode
+end
+
+--- The single dictionary the "dict" tap mode looks the word up in
+-- (nil = all enabled dictionaries).
+function Furigana:getTapDictName()
+    return G_reader_settings:readSetting("furigana_tap_dict")
 end
 
 --- Register the whole-screen single-tap zone once the reader is ready. It runs
@@ -288,6 +310,7 @@ end
 -- declines (returns false) when it has nothing to show, letting the tap fall
 -- through to those.
 function Furigana:onReaderReady()
+    self:precacheSchedule() -- initial window fill for the opened position
     if self._reveal_zone_registered then return end
     if not (self.ui and self.ui.registerTouchZones and self.ui.rolling) then return end
     self.ui:registerTouchZones({
@@ -309,7 +332,14 @@ function Furigana:onReaderReady()
 end
 
 function Furigana:onTapReveal(ges)
-    if not (self:isTapRevealEnabled() or self:isTapAudioEnabled()) then return false end
+    -- While the auto reader speaks, a tap anywhere is "stop reading".
+    if self.autoreader and self.autoreader:isActive() then
+        self.autoreader:stop(_("Auto reader stopped"))
+        return true
+    end
+    if self:getTapDisplayMode() == "none" and not self:isTapAudioEnabled() then
+        return false
+    end
     return self:revealAtPos(ges and ges.pos) or false
 end
 
@@ -358,17 +388,59 @@ function Furigana:revealAtPos(screen_pos, want_popup)
         audio_started = self:speakText(word.word) or false
     end
 
-    local display
-    if want_popup or self:isTapRevealEnabled() then
-        display = self:getWordReadingDisplay(word)
+    -- What to display for the word: the reading popup (default, optionally
+    -- with a translation line), a dictionary window, the translator window,
+    -- or nothing. The explicit gesture always means the popup (with the
+    -- translation when that flavor is configured).
+    local mode = self:getTapDisplayMode()
+    if want_popup and mode ~= "popup_translate" then
+        mode = "popup"
     end
-    if not display then
+    if mode == "dict" then
+        return self:showTapDict(word, pos) or audio_started
+    elseif mode == "translate" then
+        return self:showTapTranslation(word) or audio_started
+    elseif mode ~= "popup" and mode ~= "popup_translate" then -- "none"
         return audio_started
     end
 
+    local display = self:getWordReadingDisplay(word)
+    if not display then
+        if mode == "popup_translate" then
+            -- Kana-only words have no reading to add, but the translation
+            -- line still makes the popup worth showing.
+            display = word.word
+        else
+            return audio_started
+        end
+    end
+
+    if mode == "popup_translate" then
+        local cached = self._tap_translations and self._tap_translations[word.word]
+        if cached then
+            self:showReadingPopup(display .. "\n" .. cached, word, pos, screen_pos)
+        else
+            -- Reading first (instant), translation swapped in when it lands.
+            self:showReadingPopup(display, word, pos, screen_pos)
+            self:fetchTranslationForPopup(display, word, pos, screen_pos)
+        end
+    else
+        self:showReadingPopup(display, word, pos, screen_pos)
+    end
+    return true
+end
+
+--- Show the small anchored popup for a word, replacing whichever reading
+-- popup is currently up (taps replace popups naturally; the translation
+-- update swaps them programmatically).
+function Furigana:showReadingPopup(text, word, pos, screen_pos)
     local ReadingPopup = require("readingpopup")
-    UIManager:show(ReadingPopup:new{
-        text = display,
+    if self._reading_popup then
+        UIManager:close(self._reading_popup)
+    end
+    local popup
+    popup = ReadingPopup:new{
+        text = text,
         anchor_box = word.sbox and self.ui.view:pageToScreenTransform(pos.page, word.sbox),
         tap_callback = function()
             -- Tap on the popup: escalate to the full word analysis
@@ -376,8 +448,71 @@ function Furigana:revealAtPos(screen_pos, want_popup)
             self.ui:handleEvent(Event:new("ShowJapaneseAnalysis",
                 { pos = { x = screen_pos.x, y = screen_pos.y } }))
         end,
-    })
-    return true
+        close_callback = function()
+            if self._reading_popup == popup then
+                self._reading_popup = nil
+            end
+        end,
+    }
+    self._reading_popup = popup
+    UIManager:show(popup)
+end
+
+--- Fetch the word's English translation in a dismissable background
+-- subprocess and swap the reading popup for a two-line version (reading on
+-- top, bare translation underneath). Results are kept for the session, so a
+-- word is only ever fetched once. A tap while fetching dismisses the wait
+-- (it usually replaces the popup anyway), leaving the reading-only popup.
+function Furigana:fetchTranslationForPopup(display, word, pos, screen_pos)
+    local text = word.word
+    Trapper:wrap(function()
+        local Translator = require("ui/translator")
+        local completed, translated = Trapper:dismissableRunInSubprocess(function()
+            -- Target pinned to English (the popup shows just the bare
+            -- translation line); source pinned to Japanese — auto-detection
+            -- misfires on single words.
+            local ok, res = pcall(Translator.translate, Translator, text, "en", "ja")
+            return (ok and type(res) == "string") and res or ""
+        end, nil, true) -- invisible trap; plain-string result
+        if not completed or not translated then return end
+        translated = util.trim(translated)
+        if translated == "" or translated == text then return end
+        self._tap_translations = self._tap_translations or {}
+        self._tap_translations[text] = translated
+        -- Only swap if this word's reading popup is still the one showing.
+        if self._reading_popup and self._reading_popup.text == display then
+            self:showReadingPopup(display .. "\n" .. translated, word, pos, screen_pos)
+        end
+    end)
+end
+
+--- Tap mode "dict": open the dictionary window for the expanded word,
+-- restricted to the chosen dictionary (when one is set). Positioned next to
+-- the word like a normal lookup. Returns true when the lookup was started.
+function Furigana:showTapDict(word, pos)
+    local dictionary = self.ui and self.ui.dictionary
+    if not (dictionary and dictionary.onLookupWord) then return false end
+    local boxes
+    if word.sbox and pos and self.ui.view then
+        local sb = self.ui.view:pageToScreenTransform(pos.page, word.sbox)
+        if sb then boxes = { sb } end
+    end
+    local opts
+    local dict_name = self:getTapDictName()
+    if dict_name then
+        opts = { dict_names = { dict_name } }
+    end
+    local ok = pcall(dictionary.onLookupWord, dictionary,
+        word.word, false, boxes, nil, nil, nil, opts)
+    return ok
+end
+
+--- Tap mode "translate": the built-in translator (Google Translate; needs
+-- network) on the expanded word, in its detailed view.
+function Furigana:showTapTranslation(word)
+    local ok, Translator = pcall(require, "ui/translator")
+    if not ok then return false end
+    return pcall(Translator.showTranslation, Translator, word.word, true) and true
 end
 
 --- Expand the tapped (often single-character) crengine word to the full
@@ -454,8 +589,88 @@ function Furigana:voicevoxOpts()
 end
 
 function Furigana:audioCachePathFor(opts, text)
-    local key = hash_str(("%s|%s|%s"):format(opts.url, opts.speaker, text))
+    -- Keyed through precache.lua so background-precached files (same keying)
+    -- are interchangeable with foreground-fetched ones.
+    local key = require("precache").audioKey(opts.url, opts.speaker, text)
     return self.cache_dir .. "/audio/" .. key .. ".wav"
+end
+
+-- Where the background precache worker would have put this text's audio.
+function Furigana:precachedAudioPathFor(opts, text)
+    local key = require("precache").audioKey(opts.url, opts.speaker, text)
+    return self.cache_dir .. "/audio/precache/" .. key .. ".wav"
+end
+
+-- ------------------------------------------------------------ audio precache --
+-- Keep the words of the two previous, current and two next pages synthesized
+-- ahead of time (background subprocess; see precache.lua), so tap audio plays
+-- instantly. Stale pages' files are pruned automatically by the worker.
+
+function Furigana:isPrecacheEnabled()
+    return G_reader_settings:nilOrTrue("furigana_audio_precache")
+end
+
+function Furigana:getPrecache()
+    if not self._precache then
+        self._precache = require("precache").newController(self)
+    end
+    return self._precache
+end
+
+--- (Re-)target the precache window at the current page, debounced; called on
+-- every page turn and whenever a setting it depends on changes.
+function Furigana:precacheSchedule()
+    if not (self:isTapAudioEnabled() and self:isPrecacheEnabled()) then return end
+    if not (self.ui and self.ui.rolling and self.ui.document) then return end
+    if self:isShowingAnnotated() then return end
+    self:getPrecache():schedule()
+end
+
+function Furigana:onPageUpdate(page)
+    if self.autoreader then
+        self.autoreader:onPageUpdate(page) -- manual navigation stops it
+    end
+    self:precacheSchedule()
+end
+
+--- The text of one rendered page (page top to next page top; the last page
+-- walks to the end of the book). Shared by the precache window capture and
+-- the auto reader. Returns nil when it can't be had.
+function Furigana:pageText(page)
+    local doc = self.ui and self.ui.document
+    if not doc then return nil end
+    local ok, text = pcall(function()
+        local xp0 = doc:getPageXPointer(page)
+        if not xp0 then return nil end
+        if page + 1 <= doc:getPageCount() then
+            local xp1 = doc:getPageXPointer(page + 1)
+            if xp1 then return doc:getTextFromXPointers(xp0, xp1) end
+        end
+        local e = xp0
+        for _ = 1, 800 do
+            local nxt = doc:getNextVisibleChar(e)
+            if not nxt or nxt == e then break end
+            e = nxt
+        end
+        if e ~= xp0 then return doc:getTextFromXPointers(xp0, e) end
+        return nil
+    end)
+    return ok and text or nil
+end
+
+-- -------------------------------------------------------------- auto reader --
+-- Continuous read-aloud with automatic page turns (see autoreader.lua).
+
+function Furigana:getAutoReader()
+    if not self.autoreader then
+        self.autoreader = require("autoreader").newController(self)
+    end
+    return self.autoreader
+end
+
+function Furigana:onToggleAutoRead()
+    self:getAutoReader():toggle()
+    return true
 end
 
 function Furigana:playAudioFile(path)
@@ -490,15 +705,35 @@ function Furigana:speakText(text)
     if lfs.attributes(audio_dir, "mode") ~= "directory" then
         util.makePath(audio_dir)
     end
+    -- A precached word plays just as instantly; promote it into the permanent
+    -- cache so the window pruning can no longer delete it (the user showed
+    -- actual interest in this word).
+    local pre = self:precachedAudioPathFor(opts, text)
+    if lfs.attributes(pre, "mode") == "file" and os.rename(pre, path) then
+        self:playAudioFile(path)
+        return true
+    end
     local tmp = path .. ".tmp"
     Trapper:wrap(function()
         local VoiceVox = require("voicevox")
+        -- Words come back fast and a new tap should silently take over, so
+        -- they get the invisible trap. Sentence/paragraph selections can
+        -- legitimately take minutes on a slow (on-device) engine — show a
+        -- visible "working…" trap so the wait is deliberate, not a hang;
+        -- synthesis itself runs to completion (no socket timeout, see
+        -- voicevox.lua), and tapping the trap is the way to cancel.
+        local trap_widget = #text > 36
+            and _("Generating audio… (tap to cancel)") or nil
+        -- Hold the precache worker off the engine while the user is waiting
+        -- for this very word.
+        if self._precache then self._precache:setForegroundFetch(true) end
         local completed, ok, err = Trapper:dismissableRunInSubprocess(function()
             -- The subprocess writes the file itself; only simple values cross
             -- the process boundary.
             local fetched, ferr = VoiceVox.fetch(opts, text, tmp)
             return fetched == true, ferr and tostring(ferr) or nil
-        end, nil) -- invisible trap widget: any tap dismisses the wait
+        end, trap_widget) -- nil: invisible trap widget, any tap dismisses
+        if self._precache then self._precache:setForegroundFetch(false) end
         if not completed then
             os.remove(tmp)
             return
@@ -537,6 +772,9 @@ function Furigana:promptVoicevoxUrl(touchmenu_instance)
                     local url = util.trim(dialog:getInputText() or "")
                     G_reader_settings:saveSetting("furigana_voicevox_url", url ~= "" and url or nil)
                     UIManager:close(dialog)
+                    -- New server, new cache keys: re-target the precache.
+                    if self._precache then self._precache:invalidate() end
+                    self:precacheSchedule()
                     if touchmenu_instance then touchmenu_instance:updateItems() end
                 end,
             },
@@ -547,6 +785,12 @@ function Furigana:promptVoicevoxUrl(touchmenu_instance)
 end
 
 function Furigana:onCloseDocument()
+    if self.autoreader then
+        self.autoreader:stop() -- silent; also releases standby/screen holds
+    end
+    if self._precache then
+        self._precache:stop()
+    end
     -- Drop the kept Android MediaPlayer; audioplayer is package.loaded-cached,
     -- so it outlives this plugin instance.
     local ok, AudioPlayer = pcall(require, "audioplayer")
@@ -866,7 +1110,9 @@ function Furigana:showMatchChooser(new_ui, results, source_frac)
     end
 
     local kv = {}
-    for _, row in ipairs(rows) do
+    -- numeric loop: "for _, row" would shadow gettext's _ for the T(_(...))
+    for i = 1, #rows do
+        local row = rows[i]
         local snippet = ""
         local ok, s = pcall(function() return doc:getTextFromXPointers(row.r.start, row.r["end"], false) end)
         if ok and s then snippet = s:gsub("[\r\n]+", " "):sub(1, 40) end
@@ -1041,6 +1287,8 @@ function Furigana:clearCache()
     end
     collect(self.cache_dir)
     collect(self.cache_dir .. "/audio") -- cached VOICEVOX word audio
+    collect(self.cache_dir .. "/audio/precache") -- precached window audio
+    collect(self.cache_dir .. "/audio/sentences") -- auto-reader sentence audio
 
     if #files == 0 then
         UIManager:show(InfoMessage:new{ text = _("The furigana cache is already empty.") })
@@ -1056,6 +1304,10 @@ function Furigana:clearCache()
             local removed = 0
             for _, p in ipairs(files) do
                 if os.remove(p) then removed = removed + 1 end
+            end
+            if self._precache then
+                self._precache:invalidate()
+                self:precacheSchedule()
             end
             UIManager:show(InfoMessage:new{
                 text = T(N_("Deleted %1 file.", "Deleted %1 files.", removed), removed),
@@ -1079,6 +1331,78 @@ local GRADE_LEVELS = {
     { g = 8, text = _("Jinmeiyō and rarer") },
     { g = 9, text = _("Non-Jōyō kanji only") },
 }
+
+-- Tap display modes (what a short tap on a word shows).
+local TAP_MODES = {
+    { mode = "popup", text = _("Reading popup"),
+      help = _("A small popup with the word's reading right above it, like tapping a word in Anki. Tap the popup to open the full analysis.") },
+    { mode = "popup_translate", text = _("Reading popup + translation"),
+      help = _("The reading popup, with the word's English translation (Google Translate; needs a network connection) added underneath. The reading appears immediately; the translation line follows as soon as it arrives and is remembered for the session.") },
+    { mode = "dict", text = _("Dictionary entry"),
+      help = _("Look the word up like a normal dictionary lookup — in the single dictionary chosen below, or in all of them.") },
+    { mode = "translate", text = _("Translation"),
+      help = _("Show the word in the built-in translator (Google Translate; needs a network connection).") },
+    { mode = "none", text = _("Nothing"),
+      help = _("Show nothing. With word audio enabled, a tap only speaks the word.") },
+}
+
+function Furigana:genTapModeItems()
+    local items = {}
+    for _, m in ipairs(TAP_MODES) do
+        local mode = m.mode
+        items[#items + 1] = {
+            text = m.text,
+            checked_func = function() return self:getTapDisplayMode() == mode end,
+            radio = true,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                G_reader_settings:saveSetting("furigana_tap_display", mode)
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+            help_text = m.help,
+        }
+    end
+    items[#items].separator = true
+    items[#items + 1] = {
+        text_func = function()
+            return T(_("Dictionary: %1"), self:getTapDictName() or _("all dictionaries"))
+        end,
+        enabled_func = function() return self:getTapDisplayMode() == "dict" end,
+        sub_item_table_func = function() return self:genTapDictItems() end,
+        help_text = _("Which dictionary the 'Dictionary entry' tap mode uses."),
+    }
+    return items
+end
+
+function Furigana:genTapDictItems()
+    local items = {
+        {
+            text = _("All dictionaries"),
+            checked_func = function() return self:getTapDictName() == nil end,
+            radio = true,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                G_reader_settings:delSetting("furigana_tap_dict")
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        },
+    }
+    local names = (self.ui and self.ui.dictionary and self.ui.dictionary.enabled_dict_names) or {}
+    for _, name in ipairs(names) do
+        local n = name
+        items[#items + 1] = {
+            text = n,
+            checked_func = function() return self:getTapDictName() == n end,
+            radio = true,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                G_reader_settings:saveSetting("furigana_tap_dict", n)
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        }
+    end
+    return items
+end
 
 function Furigana:genLevelItems()
     local items = {}
@@ -1114,16 +1438,20 @@ function Furigana:addToMainMenu(menu_items)
 The readings are generated on-device; the first run on a book may take a little while, after which the result is cached. Toggle again to return to the original book.]]),
             },
             {
-                text = _("Tap a word to show its reading"),
-                checked_func = function() return self:isTapRevealEnabled() end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    G_reader_settings:flipNilOrTrue("furigana_tap_reveal")
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                text_func = function()
+                    -- numeric loop: "for _, m" would shadow gettext's _
+                    local mode = self:getTapDisplayMode()
+                    for i = 1, #TAP_MODES do
+                        if TAP_MODES[i].mode == mode then
+                            return T(_("On word tap show: %1"), TAP_MODES[i].text:lower())
+                        end
+                    end
+                    return _("On word tap show…")
                 end,
-                help_text = _([[Show a small popup with a word's reading when you tap it, without annotating the whole book — like tapping a word in Anki. The first tap in a session loads the dictionary, which takes a moment. Tap the popup itself to open the full word analysis (needs the Japanese plugin).
+                sub_item_table_func = function() return self:genTapModeItems() end,
+                help_text = _([[What tapping a Japanese word shows, without annotating the whole book: a small popup with its reading (like tapping a word in Anki), its entry from a dictionary of your choice, the built-in translator, or nothing. Word audio (below) plays in addition, independently of this choice.
 
-This takes priority over the Japanese plugin's 'Tap a word to analyse it'; disable it here to get that back on single tap. 'Show furigana for word' can also be bound to any gesture.]]),
+Showing something on tap takes priority over the Japanese plugin's 'Tap a word to analyse it'; choose 'Nothing' (and disable tap audio) to get that back on single tap. 'Show furigana for word' can also be bound to any gesture.]]),
             },
             {
                 text = _("Word audio (VOICEVOX)"),
@@ -1137,11 +1465,34 @@ Works together with or independently of the reading popup: enable either one, bo
                         keep_menu_open = true,
                         callback = function(touchmenu_instance)
                             G_reader_settings:flipNilOrFalse("furigana_tap_audio")
+                            if self:isTapAudioEnabled() then
+                                self:precacheSchedule()
+                            elseif self._precache then
+                                self._precache:stop()
+                            end
                             if touchmenu_instance then touchmenu_instance:updateItems() end
                         end,
                         help_text = _([[Play the tapped word's audio. With the reading popup also enabled, you get both; with it disabled, tapping only speaks the word.
 
 Audio is fetched from the configured VOICEVOX server on first use and cached. Tapping elsewhere while audio is still loading cancels it and reveals the new word instead.]]),
+                    },
+                    {
+                        text = _("Precache nearby pages"),
+                        checked_func = function() return self:isPrecacheEnabled() end,
+                        enabled_func = function() return self:isTapAudioEnabled() end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            G_reader_settings:flipNilOrTrue("furigana_audio_precache")
+                            if self:isTapAudioEnabled() and self:isPrecacheEnabled() then
+                                self:precacheSchedule()
+                            elseif self._precache then
+                                self._precache:stop()
+                            end
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                        help_text = _([[Quietly prepare the audio of every word on the two previous, the current and the two next pages in the background, so tapped words play instantly. Audio of pages you move away from is deleted again automatically; words you actually played are kept.
+
+Needs the Japanese plugin and your dictionaries (to predict the words a tap would speak), and works in the original book, like tap audio itself.]]),
                     },
                     {
                         text_func = function()
@@ -1172,10 +1523,30 @@ Audio is fetched from the configured VOICEVOX server on first use and cached. Ta
                                 default_value = VoiceVox.DEFAULT_SPEAKER,
                                 callback = function(spin)
                                     G_reader_settings:saveSetting("furigana_voicevox_speaker", spin.value)
+                                    -- New voice, new cache keys: re-target the precache.
+                                    if self._precache then self._precache:invalidate() end
+                                    self:precacheSchedule()
                                     if touchmenu_instance then touchmenu_instance:updateItems() end
                                 end,
                             })
                         end,
+                    },
+                    {
+                        text_func = function()
+                            return (self.autoreader and self.autoreader:isActive())
+                                and _("Stop auto reader") or _("Auto reader (read aloud)")
+                        end,
+                        enabled_func = function()
+                            return self.ui ~= nil and self.ui.rolling ~= nil
+                                and not self:isShowingAnnotated()
+                        end,
+                        callback = function(touchmenu_instance)
+                            if touchmenu_instance then touchmenu_instance:closeMenu() end
+                            self:getAutoReader():toggle()
+                        end,
+                        help_text = _([[Read the book aloud through VOICEVOX: starting at the top of the current page, every sentence is spoken in order, pages turn by themselves, and upcoming sentences are synthesized while one is playing, so the audio flows without interruptions.
+
+Tap the page (or turn it yourself) to stop. Works in the original (un-annotated) book. 'Auto reader (VOICEVOX)' can also be bound to a gesture.]]),
                     },
                     {
                         text = _("Test audio (食べる)"),
