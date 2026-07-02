@@ -172,3 +172,62 @@ engine touched, so the Lua side classifies against identical data without SQLite
 The curated set covers the acceptance cases (`食べさせられました`, `行かなかった`,
 `高くない`, `静かじゃない`, `来られた`, `勉強しました`, `できます`, `よさそう`,
 a plain noun and a particle) plus the documented edge cases.
+
+## Sentence splitting (read with the volume keys) ##
+
+A fourth feature turns the **volume / page-turn keys** into a
+sentence-by-sentence reader: *Menu → Japanese → Sentence splitting (volume
+keys)*. While enabled the keys no longer turn pages (tapping still does): the
+first press picks the current page's **first sentence**, speaks it through
+**VOICEVOX** (the server configured under *Furigana → Word audio*) and shows
+it in a small popup **right above the sentence being read** (below it when
+there is no room above; at the bottom of the screen when the sentence cannot
+be located on the page) together with its **Google translation** — with each
+word's reading **spliced in as furigana** (`私（わたし）は行（い）く。`;
+furigana and translation each have their own toggle in the submenu). Forward
+= next sentence, back = previous one; stepping past either end of the page
+turns it, and a sentence that runs across a page boundary is completed with
+the next page's beginning (the same splitter as the Furigana plugin's auto
+reader, so nothing is read twice or cut off).
+
+The translation needs a **network connection** — the audio may not (the
+VOICEVOX engine can run on the device itself), so with Wi-Fi off you still
+get speech but no translation. Because that asymmetry is easy to miss, the
+feature says so once per session ("No network — sentence translations are
+unavailable", or "Sentence translation failed" when online attempts keep
+failing); previously cached translations keep showing offline.
+
+Smoothness comes from working ahead: one background subprocess keeps the audio
+**and** the translation of the **next two sentences** cached (WAVs in the auto
+reader's sentence cache — the two features share files; translations as small
+text files under `cache/japanese_sentences/`), so stepping forward is instant.
+The popup swaps the translation in as soon as it arrives. A **single tap** on
+the popup **shows/hides the translation** (the choice sticks for the session,
+so you can read "translation only when I'm stuck" — it keeps being prefetched,
+so revealing is instant); a **double tap replays the sentence's audio**; a tap
+anywhere else passes through (word lookups and page turns keep working).
+*"Japanese sentence splitting"* can also be bound to a gesture to toggle the
+feature.
+
+Needs the **Furigana plugin** enabled (it provides the sentence splitter, the
+VOICEVOX client, the tokenizer and the audio caches). On Android the volume
+keys must not be ignored (KOReader's device settings) — the default when
+volume-key page turning is in use.
+
+ * `sentencesplitting.lua` — pure page building / boundary carry / ruby
+   display, plus the controller: ReaderRolling's page-turn key bindings are
+   deactivated (`is_inactive`) while the feature is on and their exact key
+   sequences are reused for stepping; the popup anchor is found with
+   crengine's `findText` scoped to the current page (a page-spanning sentence
+   by its on-page part; the selection highlight it sets is cleared at once);
+   a single fetch subprocess with capped retries and a hung-fetch deadline
+   keeps the lookahead warm and pauses the word-audio precache (`fg.lock`)
+   while it holds the engine.
+ * `sentencepopup.lua` — the popup bubble, anchored above/below the sentence
+   via MovableContainer's anchor logic (bottom of the screen without an
+   anchor); while shown it is the topmost window, so it binds the same key
+   sequences itself and forwards them to the controller.
+
+```sh
+lua5.3 tools/run_sentencesplitting_test.lua               # ALL TESTS PASSED
+```

@@ -553,11 +553,22 @@ function Japanese:onDispatcherRegisterActions()
         title = _("Analyse Japanese word"),
         reader = true,
     })
+    Dispatcher:registerAction("japanese_sentence_splitting", {
+        category = "none",
+        event = "ToggleSentenceSplitting",
+        title = _("Japanese sentence splitting (volume keys)"),
+        reader = true,
+    })
 end
 
---- Register the single-tap touch zone once the reader (view/document) is ready.
+--- Register the single-tap touch zone once the reader (view/document) is
+-- ready, and repurpose the page-turn keys when sentence splitting is on.
 function Japanese:onReaderReady()
     self:setupAnalyseTouchZone()
+    if self:isSentenceSplittingEnabled() and self.ui and self.ui.rolling then
+        local ctrl = self:getSentenceSplit()
+        if ctrl then ctrl:applyKeys(true) end
+    end
 end
 
 --- A high-priority "tap" zone: it analyses the word under the tap and otherwise
@@ -627,6 +638,87 @@ function Japanese:expandWord(word)
         end
     end
     return word.word
+end
+
+-- ------------------------------------------------------- sentence splitting --
+-- Read the book sentence by sentence with the volume/page-turn keys: each
+-- press speaks the sentence through VOICEVOX and shows it (optionally with
+-- furigana) plus its translation in a bottom popup, with the next sentences'
+-- audio and translation precached. While enabled, the keys step sentences
+-- instead of turning pages (see sentencesplitting.lua).
+
+function Japanese:isSentenceSplittingEnabled()
+    return G_reader_settings:isTrue("language_japanese_sentence_splitting")
+end
+
+--- The lazy sentence-splitting controller; nil (logged once) when the
+-- furigana plugin — which provides the splitter, the VOICEVOX client and the
+-- caches — is unavailable.
+function Japanese:getSentenceSplit()
+    if self._sentence_split == nil then
+        local ok, ctrl = pcall(function()
+            return require("sentencesplitting").newController(self)
+        end)
+        if not ok then
+            logger.warn("japanese.koplugin: sentence splitting unavailable:", ctrl)
+        end
+        self._sentence_split = ok and ctrl or false
+    end
+    return self._sentence_split or nil
+end
+
+--- Enable/disable sentence splitting: saves the setting and immediately
+-- repurposes/restores the page-turn keys in the open reader.
+function Japanese:setSentenceSplitting(on)
+    if on and not self:getSentenceSplit() then
+        UIManager:show(InfoMessage:new{
+            text = _("Sentence splitting needs the Furigana plugin (it provides the sentence splitter and VOICEVOX audio)."),
+        })
+        return
+    end
+    G_reader_settings:saveSetting("language_japanese_sentence_splitting", on)
+    local ctrl = self:getSentenceSplit()
+    if ctrl then
+        ctrl:applyKeys(on)
+        if not on then ctrl:stop() end
+    end
+end
+
+--- Gesture/dispatcher-bound toggle ("Japanese sentence splitting").
+function Japanese:onToggleSentenceSplitting()
+    local on = not self:isSentenceSplittingEnabled()
+    self:setSentenceSplitting(on)
+    if self:isSentenceSplittingEnabled() == on then
+        UIManager:show(InfoMessage:new{
+            text = on and _("Sentence splitting on — press a volume/page key to read the first sentence.")
+                or _("Sentence splitting off — the keys turn pages again."),
+            timeout = 2,
+        })
+    end
+    return true
+end
+
+--- Page-turn key presses reach us only while ReaderRolling's own bindings
+-- are deactivated (sentence splitting on, see applyKeys): step sentences.
+function Japanese:onKeyPress(key)
+    if not (self._sentence_split and self:isSentenceSplittingEnabled()
+            and self.ui and self.ui.rolling) then
+        return
+    end
+    return self._sentence_split:onKeyPress(key)
+end
+
+--- Manual navigation drops the sentence session (self-caused flips don't).
+function Japanese:onPageUpdate(page)
+    if self._sentence_split then
+        self._sentence_split:onPageUpdate(page)
+    end
+end
+
+function Japanese:onCloseDocument()
+    if self._sentence_split then
+        self._sentence_split:stop()
+    end
 end
 
 --- Add an "Analyse (JA)" button to the dictionary lookup popup, so the whole
@@ -842,6 +934,48 @@ You can also bind “Analyse Japanese word” to a gesture under Gestures.]]),
             G_reader_settings:saveSetting("language_japanese_translate_enabled", not on)
             if touchmenu_instance then touchmenu_instance:updateItems() end
         end,
+    })
+
+    -- Sentence splitting: volume keys read the book sentence by sentence
+    -- (VOICEVOX audio + translation popup + optional furigana).
+    table.insert(sub_item_table, {
+        text = _("Sentence splitting (volume keys)"),
+        help_text = _([[
+Read the book sentence by sentence with the volume/page-turn keys. Each press speaks the sentence through VOICEVOX (configure the server under Furigana → Word audio), and shows it with its translation in a small popup at the bottom — the audio and translation of the next two sentences are prepared in the background, so stepping forward is smooth.
+
+While enabled, the keys step sentences instead of turning pages (tapping still turns them); the first press starts at the current page's first sentence. Tap the popup to hear the sentence again. Needs the Furigana plugin.]]),
+        sub_item_table = {
+            {
+                text = _("Volume keys read sentences"),
+                checked_func = function() return self:isSentenceSplittingEnabled() end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:setSentenceSplitting(not self:isSentenceSplittingEnabled())
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _("Repurpose the volume/page-turn keys: forward = next sentence (audio + translation), back = previous sentence. Turn off to get page turning back. Can also be toggled by binding 'Japanese sentence splitting' to a gesture."),
+            },
+            {
+                text = _("Show furigana in the sentence popup"),
+                checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_furigana") end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:flipNilOrTrue("language_japanese_sentence_furigana")
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _("Splice each word's reading into the sentence shown in the popup, e.g. 私（わたし）は行（い）く。 Uses the Furigana plugin's dictionary (the first sentence loads it, which takes a moment)."),
+            },
+            {
+                text = _("Show translation in the sentence popup"),
+                checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_translate") end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:flipNilOrTrue("language_japanese_sentence_translate")
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _("Show the sentence's Google translation under it in the popup (it appears as soon as it arrives and is cached). Needs a network connection — the audio does not, so with Wi-Fi off you still get speech, just no translation."),
+            },
+        },
     })
 
     -- Order of the analysis pages (AI / Google Translate / dictionaries).
