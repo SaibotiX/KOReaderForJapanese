@@ -302,19 +302,20 @@ check(recorded and eq_list(recorded.dict_names, { "Dict B" })
     and recorded.opts.source_collection == "Mono",
     "no explicit collection: falls back to the active one")
 
--- Button callback: looks up the popup's displayed word in the collection
+-- Button callback: looks up the originally SELECTED text (dict_popup.word),
+-- not the current result's headword (dict_popup.lookupword).
 recorded = nil
 b2.callback({ lookupword = "走る", word = "走った", word_boxes = { "wb" } })
-check(recorded and recorded.word == "走る" and eq_list(recorded.dict_names, { "Dict C", "Dict A" })
+check(recorded and recorded.word == "走った" and eq_list(recorded.dict_names, { "Dict C", "Dict A" })
     and recorded.boxes and recorded.boxes[1] == "wb",
-    "collection button re-queries the displayed word in that collection")
+    "collection button re-queries the selected word (not the result headword)")
 
--- "All dictionaries" callback: normal lookup with all enabled dicts
+-- "All dictionaries" callback: normal lookup of the selected word.
 recorded = nil
 b4.callback({ lookupword = "走る", word = "走った", word_boxes = nil, source_collection = "JP" })
-check(recorded and recorded.word == "走る" and eq_list(recorded.dict_names, { "Dict A", "Dict B", "Dict C" })
+check(recorded and recorded.word == "走った" and eq_list(recorded.dict_names, { "Dict A", "Dict B", "Dict C" })
     and recorded.opts.source_collection == nil,
-    "All dictionaries button broadens back to a normal lookup")
+    "All dictionaries button broadens back to a normal lookup of the selected word")
 
 -- Mutations re-register buttons (wipe + rebuild)
 rd.dict_collections["Empty"] = nil

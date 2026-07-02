@@ -735,11 +735,14 @@ function Japanese:registerDictButton()
         row_group = "ja_word_actions",
         show_func = function(dict_popup)
             if dict_popup.is_wiki then return false end
-            local w = dict_popup.lookupword or dict_popup.word
+            -- Gate on the originally selected text (dict_popup.word), the same
+            -- text the callback analyses -- not the current result's headword
+            -- (dict_popup.lookupword, which changes as you page dictionaries).
+            local w = dict_popup.word or dict_popup.lookupword
             return w ~= nil and util.hasCJKChar(w)
         end,
         callback = function(dict_popup)
-            self:showAnalysis(dict_popup.lookupword or dict_popup.word)
+            self:showAnalysis(dict_popup.word or dict_popup.lookupword)
         end,
     })
 end

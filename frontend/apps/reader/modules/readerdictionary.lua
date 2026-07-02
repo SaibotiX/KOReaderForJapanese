@@ -400,7 +400,10 @@ function ReaderDictionary:refreshCollectionDictButtons()
                 return not dict_popup.is_wiki and dict_popup.source_collection ~= name
             end,
             callback = function(dict_popup)
-                self:lookupWordInCollection(dict_popup.lookupword or dict_popup.word, true,
+                -- Look up the originally selected text (dict_popup.word), not
+                -- the current result's headword (dict_popup.lookupword, which
+                -- changes as you page through dictionaries).
+                self:lookupWordInCollection(dict_popup.word or dict_popup.lookupword, true,
                     dict_popup.word_boxes, nil, nil, nil, name)
             end,
         })
@@ -415,7 +418,8 @@ function ReaderDictionary:refreshCollectionDictButtons()
             return not dict_popup.is_wiki and dict_popup.source_collection ~= nil
         end,
         callback = function(dict_popup)
-            self:onLookupWord(dict_popup.lookupword or dict_popup.word, true, dict_popup.word_boxes)
+            -- The originally selected text, not the current result's headword.
+            self:onLookupWord(dict_popup.word or dict_popup.lookupword, true, dict_popup.word_boxes)
         end,
     })
     for i, entry in ipairs(entries) do
