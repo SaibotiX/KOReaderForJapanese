@@ -148,5 +148,102 @@ check(req6.calls[1].url:match("speaker=" .. VoiceVox.DEFAULT_SPEAKER),
     "non-numeric speaker falls back to the default")
 os.remove(out)
 
+-- --------------------------------------------------- loudness normalization --
+-- The engine renders each request at a different level; normalizeLoudness
+-- scales the 16-bit PCM so the speech RMS sits at NORMALIZE_TARGET_DB
+-- (-20 dBFS => 3276.8 in sample units), without ever clipping a peak.
+
+local function u16le(v) return string.char(v % 256, math.floor(v / 256) % 256) end
+local function u32le(v)
+    return string.char(v % 256, math.floor(v / 256) % 256,
+        math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
+end
+local function make_wav(samples)
+    local data = {}
+    for _, s in ipairs(samples) do
+        data[#data + 1] = u16le(s < 0 and s + 65536 or s)
+    end
+    data = table.concat(data)
+    local fmt = u16le(1) .. u16le(1) .. u32le(24000) .. u32le(48000) .. u16le(2) .. u16le(16)
+    return "RIFF" .. u32le(4 + 8 + #fmt + 8 + #data) .. "WAVE"
+        .. "fmt " .. u32le(#fmt) .. fmt .. "data" .. u32le(#data) .. data
+end
+local function samples_of(wav)
+    local out2 = {}
+    for i = 45, #wav - 1, 2 do
+        local a, b = wav:byte(i, i + 1)
+        local s = a + b * 256
+        out2[#out2 + 1] = s >= 32768 and s - 65536 or s
+    end
+    return out2
+end
+
+local quiet = {}
+for i = 1, 200 do quiet[i] = (i % 2 == 0) and 1000 or -1000 end
+local quiet_wav = make_wav(quiet)
+local norm = VoiceVox.normalizeLoudness(quiet_wav)
+check(norm ~= nil and #norm == #quiet_wav,
+    "quiet audio is rewritten at the same byte length")
+local ns = samples_of(norm)
+check(ns[1] == -3277 and ns[2] == 3277,
+    "quiet speech is boosted to the target level: " .. tostring(ns[2]))
+
+local loud = {}
+for i = 1, 200 do loud[i] = (i % 2 == 0) and 20000 or -20000 end
+ns = samples_of(VoiceVox.normalizeLoudness(make_wav(loud)))
+check(ns[1] == -5000 and ns[2] == 5000,
+    "very loud speech is attenuated (down to the min-gain clamp): " .. tostring(ns[2]))
+
+local sparse = {}
+for i = 1, 100 do sparse[i] = 0 end
+sparse[50], sparse[51] = 16384, -16384
+ns = samples_of(VoiceVox.normalizeLoudness(make_wav(sparse)))
+check(ns[1] == 0 and ns[49] == 0, "silence stays silent")
+check(ns[50] == 4096 and ns[51] == -4096,
+    "the gain is measured on the speech only, pauses don't skew it: " .. tostring(ns[50]))
+
+local peaky = {}
+for i = 1, 200 do peaky[i] = (i % 2 == 0) and 2000 or -2000 end
+peaky[100] = 30000
+ns = samples_of(VoiceVox.normalizeLoudness(make_wav(peaky)))
+local max_s = 0
+for _, s in ipairs(ns) do
+    if s < 0 then s = -s end
+    if s > max_s then max_s = s end
+end
+check(max_s <= math.floor(VoiceVox.NORMALIZE_PEAK * 32767) + 1,
+    "a hot peak caps the gain so nothing clips: max " .. max_s)
+
+local at_target = {}
+for i = 1, 200 do at_target[i] = (i % 2 == 0) and 3277 or -3277 end
+check(VoiceVox.normalizeLoudness(make_wav(at_target)) == nil,
+    "audio already at the target level is not rewritten")
+
+check(VoiceVox.normalizeLoudness("RIFFwavbytes") == nil,
+    "non-PCM bytes are refused (caller keeps the original)")
+
+-- fetch() levels what it writes; opts.normalize = false keeps the raw audio.
+local req7 = make_requester({
+    { code = 200, body = "{}" },
+    { code = 200, body = quiet_wav },
+})
+VoiceVox.fetch({ url = "http://x", speaker = 1 }, "静か", out, req7)
+local f7 = io.open(out, "rb")
+local written7 = f7:read("*a")
+f7:close()
+check(written7 ~= quiet_wav and samples_of(written7)[2] == 3277,
+    "fetch writes loudness-leveled audio by default")
+
+local req8 = make_requester({
+    { code = 200, body = "{}" },
+    { code = 200, body = quiet_wav },
+})
+VoiceVox.fetch({ url = "http://x", speaker = 1, normalize = false }, "静か", out, req8)
+f7 = io.open(out, "rb")
+written7 = f7:read("*a")
+f7:close()
+check(written7 == quiet_wav, "opts.normalize = false writes the raw engine audio")
+os.remove(out)
+
 print(failures == 0 and "\nALL TESTS PASSED" or ("\n" .. failures .. " TEST(S) FAILED"))
 os.exit(failures == 0 and 0 or 1)

@@ -38,8 +38,119 @@ function VoiceVox.urlencode(s)
     end))
 end
 
+-- ------------------------------------------------------- loudness leveling --
+-- VOICEVOX renders each request at whatever level the voice model produces:
+-- consecutive sentences easily differ by several dB (short exclamations come
+-- out hot, long flat clauses quiet). The engine has no loudness normalization
+-- of its own (its volumeScale is just a fixed multiplier), so we level the
+-- WAV ourselves right after synthesis: measure the RMS of the speech portion
+-- (samples above a silence floor, so leading/trailing pauses don't skew it),
+-- scale it to NORMALIZE_TARGET_DB, and cap the gain so peaks never clip.
+-- Pure Lua over the 16-bit PCM samples; fetches run in subprocesses, so the
+-- UI never feels the extra pass.
+
+VoiceVox.NORMALIZE_TARGET_DB = -20 -- speech RMS target, dBFS
+VoiceVox.NORMALIZE_MAX_GAIN = 4.0  -- never amplify more (would raise hiss)
+VoiceVox.NORMALIZE_MIN_GAIN = 0.25 -- nor attenuate more (bad measurement guard)
+VoiceVox.NORMALIZE_PEAK = 0.95     -- post-gain peak ceiling, fraction of full scale
+VoiceVox.NORMALIZE_FLOOR = 0.01    -- "speech" = |sample| above this fraction of FS
+
+-- Locate the sample data of a plain 16-bit PCM RIFF/WAVE. Returns data_off
+-- (1-based index of the first sample byte), data_size — or nil when `wav` is
+-- anything else (compressed, 24-bit, truncated, not a WAV…).
+local function pcm16_data_chunk(wav)
+    if #wav < 44 or wav:sub(1, 4) ~= "RIFF" or wav:sub(9, 12) ~= "WAVE" then
+        return nil
+    end
+    local function u16(i)
+        local a, b = wav:byte(i, i + 1)
+        return a + b * 256
+    end
+    local function u32(i)
+        local a, b, c, d = wav:byte(i, i + 3)
+        return a + b * 256 + c * 65536 + d * 16777216
+    end
+    local pos = 13
+    local fmt_ok = false
+    while pos + 8 <= #wav + 1 do
+        local id = wav:sub(pos, pos + 3)
+        local size = u32(pos + 4)
+        if id == "fmt " then
+            if size < 16 then return nil end
+            if u16(pos + 8) ~= 1 or u16(pos + 22) ~= 16 then
+                return nil -- not plain PCM / not 16-bit
+            end
+            fmt_ok = true
+        elseif id == "data" then
+            if not fmt_ok or pos + 7 + size > #wav then return nil end
+            return pos + 8, size
+        end
+        pos = pos + 8 + size + (size % 2)
+    end
+    return nil
+end
+
+--- Rewrite `wav` so its speech sits at the target loudness. Returns the
+-- leveled bytes (same length), or nil when the input is not plain 16-bit PCM,
+-- contains no speech, or is close enough already — callers then keep the
+-- original bytes, so this can never lose audio.
+function VoiceVox.normalizeLoudness(wav)
+    local data_off, data_size = pcm16_data_chunk(wav)
+    if not data_off or data_size < 2 then return nil end
+    data_size = data_size - (data_size % 2)
+    local last = data_off + data_size - 1
+    local floor_abs = 32768 * VoiceVox.NORMALIZE_FLOOR
+    local sum_sq, active, peak = 0, 0, 0
+    local i = data_off
+    while i <= last do
+        local hi = math.min(i + 2047, last)
+        local bytes = { wav:byte(i, hi) }
+        for j = 1, #bytes, 2 do
+            local s = bytes[j] + bytes[j + 1] * 256
+            if s >= 32768 then s = s - 65536 end
+            local a = s < 0 and -s or s
+            if a > peak then peak = a end
+            if a > floor_abs then
+                sum_sq = sum_sq + s * s
+                active = active + 1
+            end
+        end
+        i = hi + 1
+    end
+    if active == 0 or peak == 0 then return nil end
+    local rms = math.sqrt(sum_sq / active)
+    local gain = 32768 * 10 ^ (VoiceVox.NORMALIZE_TARGET_DB / 20) / rms
+    if gain > VoiceVox.NORMALIZE_MAX_GAIN then gain = VoiceVox.NORMALIZE_MAX_GAIN end
+    if gain < VoiceVox.NORMALIZE_MIN_GAIN then gain = VoiceVox.NORMALIZE_MIN_GAIN end
+    local peak_cap = VoiceVox.NORMALIZE_PEAK * 32767 / peak
+    if gain > peak_cap then gain = peak_cap end
+    if gain > 0.97 and gain < 1.03 then return nil end -- close enough already
+    local char = string.char
+    local out = { wav:sub(1, data_off - 1) }
+    i = data_off
+    while i <= last do
+        local hi = math.min(i + 2047, last)
+        local bytes = { wav:byte(i, hi) }
+        local piece = {}
+        for j = 1, #bytes, 2 do
+            local s = bytes[j] + bytes[j + 1] * 256
+            if s >= 32768 then s = s - 65536 end
+            s = math.floor(s * gain + 0.5)
+            if s > 32767 then s = 32767 elseif s < -32768 then s = -32768 end
+            if s < 0 then s = s + 65536 end
+            piece[#piece + 1] = char(s % 256, (s - s % 256) / 256)
+        end
+        out[#out + 1] = table.concat(piece)
+        i = hi + 1
+    end
+    out[#out + 1] = wav:sub(data_off + data_size)
+    return table.concat(out)
+end
+
 --- Synthesize `text` into a WAV file at `out_path`.
--- opts: { url = engine base URL, speaker = numeric speaker/style id }.
+-- opts: { url = engine base URL, speaker = numeric speaker/style id,
+-- normalize = false to skip loudness leveling (default: level it),
+-- synth_block_timeout / synth_total_timeout = per-request overrides }.
 -- Returns true on success, or nil and an error message.
 function VoiceVox.fetch(opts, text, out_path, requester)
     requester = requester or require("socket.http")
@@ -94,6 +205,11 @@ function VoiceVox.fetch(opts, text, out_path, requester)
         opts.synth_total_timeout or VoiceVox.SYNTH_TOTAL_TIMEOUT)
     if not wav or wav == "" then
         return nil, "synthesis failed: " .. tostring(serr or "empty response")
+    end
+
+    if opts.normalize ~= false then
+        local leveled = VoiceVox.normalizeLoudness(wav)
+        if leveled then wav = leveled end
     end
 
     local f = io.open(out_path, "wb")

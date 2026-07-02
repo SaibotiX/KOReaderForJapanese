@@ -585,6 +585,10 @@ function Furigana:voicevoxOpts()
     return {
         url = G_reader_settings:readSetting("furigana_voicevox_url") or VoiceVox.DEFAULT_URL,
         speaker = G_reader_settings:readSetting("furigana_voicevox_speaker") or VoiceVox.DEFAULT_SPEAKER,
+        -- Level the loudness of newly synthesized audio (the engine renders
+        -- each request at whatever volume the voice model happens to produce;
+        -- see voicevox.lua's normalizeLoudness).
+        normalize = G_reader_settings:nilOrTrue("furigana_voicevox_normalize"),
     }
 end
 
@@ -1530,6 +1534,20 @@ Needs the Japanese plugin and your dictionaries (to predict the words a tap woul
                                 end,
                             })
                         end,
+                    },
+                    {
+                        text = _("Normalize audio volume"),
+                        checked_func = function()
+                            return G_reader_settings:nilOrTrue("furigana_voicevox_normalize")
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            G_reader_settings:flipNilOrTrue("furigana_voicevox_normalize")
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                        help_text = _([[Level the loudness of the synthesized audio. VOICEVOX renders every request at whatever volume the voice model happens to produce, so consecutive words and sentences can come out noticeably louder or quieter than each other; this scales each newly fetched clip to the same speech level (peaks are never clipped).
+
+Applies to audio fetched from now on — already-cached audio keeps its old level until it is re-fetched (clear the furigana cache to renew everything at once).]]),
                     },
                     {
                         text_func = function()

@@ -671,6 +671,7 @@ function Controller:requestFetch(i)
     local opts = {
         url = self.opts.url,
         speaker = self.opts.speaker,
+        normalize = self.opts.normalize,
         synth_block_timeout = AutoReader.SYNTH_BLOCK_TIMEOUT,
         synth_total_timeout = AutoReader.SYNTH_TOTAL_TIMEOUT,
     }
