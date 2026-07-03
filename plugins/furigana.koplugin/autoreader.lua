@@ -328,7 +328,7 @@ end
 function Controller:wavFor(text)
     local lfs = require("libs/libkoreader-lfs")
     local opts = self.opts
-    local key = Precache.audioKey(opts.url, opts.speaker, text)
+    local key = Precache.audioKeyFor(opts, text)
     local candidates = {
         self:sentencesDir() .. "/" .. key .. ".wav",
         self.plugin.cache_dir .. "/audio/" .. key .. ".wav",

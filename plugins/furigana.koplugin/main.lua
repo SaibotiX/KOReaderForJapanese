@@ -595,13 +595,13 @@ end
 function Furigana:audioCachePathFor(opts, text)
     -- Keyed through precache.lua so background-precached files (same keying)
     -- are interchangeable with foreground-fetched ones.
-    local key = require("precache").audioKey(opts.url, opts.speaker, text)
+    local key = require("precache").audioKeyFor(opts, text)
     return self.cache_dir .. "/audio/" .. key .. ".wav"
 end
 
 -- Where the background precache worker would have put this text's audio.
 function Furigana:precachedAudioPathFor(opts, text)
-    local key = require("precache").audioKey(opts.url, opts.speaker, text)
+    local key = require("precache").audioKeyFor(opts, text)
     return self.cache_dir .. "/audio/precache/" .. key .. ".wav"
 end
 

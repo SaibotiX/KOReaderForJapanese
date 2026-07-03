@@ -158,7 +158,9 @@ local fs = {
 local opts = { url = "http://x", speaker = 3 }
 local page_a = { text = "私は学校へ行った。", hash = Precache.hash("私は学校へ行った。") }
 local page_b = { text = "東京タワー。", hash = Precache.hash("東京タワー。") }
-local function key(text) return Precache.audioKey(opts.url, opts.speaker, text) end
+-- The worker keys through audioKeyFor (which adds the loudness-leveling tag),
+-- so the test's expected keys must match.
+local function key(text) return Precache.audioKeyFor(opts, text) end
 
 -- Pre-state: one wanted word already precached, one already in the permanent
 -- cache, plus junk that must be pruned.

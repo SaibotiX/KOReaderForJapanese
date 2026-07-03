@@ -43,17 +43,37 @@ end
 -- consecutive sentences easily differ by several dB (short exclamations come
 -- out hot, long flat clauses quiet). The engine has no loudness normalization
 -- of its own (its volumeScale is just a fixed multiplier), so we level the
--- WAV ourselves right after synthesis: measure the RMS of the speech portion
--- (samples above a silence floor, so leading/trailing pauses don't skew it),
--- scale it to NORMALIZE_TARGET_DB, and cap the gain so peaks never clip.
+-- WAV ourselves right after synthesis: measure the speech RMS frame by frame
+-- (pause/silence frames are excluded by a floor relative to the loudest
+-- frame, so neither leading pauses nor an overall quiet clip skew it), scale
+-- it to NORMALIZE_TARGET_DB, and soft-limit the few samples that would top
+-- the peak ceiling — a lone hot peak no longer blocks the whole clip's gain
+-- (that hard cap was why leveled sentences still came out uneven).
 -- Pure Lua over the 16-bit PCM samples; fetches run in subprocesses, so the
 -- UI never feels the extra pass.
 
-VoiceVox.NORMALIZE_TARGET_DB = -20 -- speech RMS target, dBFS
-VoiceVox.NORMALIZE_MAX_GAIN = 4.0  -- never amplify more (would raise hiss)
-VoiceVox.NORMALIZE_MIN_GAIN = 0.25 -- nor attenuate more (bad measurement guard)
-VoiceVox.NORMALIZE_PEAK = 0.95     -- post-gain peak ceiling, fraction of full scale
-VoiceVox.NORMALIZE_FLOOR = 0.01    -- "speech" = |sample| above this fraction of FS
+-- Bump when the leveling behavior changes: it re-keys the audio caches (see
+-- precache.audioKeyFor), so stale files leveled the old way are refetched
+-- instead of played alongside newly leveled ones.
+VoiceVox.NORMALIZE_VERSION = 2
+
+VoiceVox.NORMALIZE_TARGET_DB = -20     -- speech RMS target, dBFS
+VoiceVox.NORMALIZE_MAX_GAIN = 8.0      -- never amplify more (would raise hiss)
+VoiceVox.NORMALIZE_MIN_GAIN = 0.25     -- nor attenuate more (bad measurement guard)
+VoiceVox.NORMALIZE_PEAK = 0.95         -- post-gain peak ceiling, fraction of full scale
+VoiceVox.NORMALIZE_KNEE = 0.8          -- soft limiting starts at this fraction of the ceiling
+VoiceVox.NORMALIZE_FRAME = 1024        -- measurement frame, samples (~43 ms at 24 kHz)
+VoiceVox.NORMALIZE_FRAME_FLOOR = 0.1   -- speech frame = RMS above this × the loudest frame
+VoiceVox.NORMALIZE_SILENCE = 0.003     -- and above this fraction of full scale (digital silence)
+
+--- The audio-cache key tag for these leveling settings: files leveled
+-- differently (or not at all) must never share a cache slot.
+-- opts.normalize == false means raw engine audio (fetch's convention;
+-- nil counts as on).
+function VoiceVox.cacheTag(opts)
+    if opts and opts.normalize == false then return "" end
+    return "n" .. tostring(VoiceVox.NORMALIZE_VERSION)
+end
 
 -- Locate the sample data of a plain 16-bit PCM RIFF/WAVE. Returns data_off
 -- (1-based index of the first sample byte), data_size — or nil when `wav` is
@@ -90,6 +110,13 @@ local function pcm16_data_chunk(wav)
     return nil
 end
 
+-- tanh for the soft limiter (LuaJIT has math.tanh, lua5.3 may not).
+local function tanh(x)
+    if x > 20 then return 1 end
+    local e = math.exp(2 * x)
+    return (e - 1) / (e + 1)
+end
+
 --- Rewrite `wav` so its speech sits at the target loudness. Returns the
 -- leveled bytes (same length), or nil when the input is not plain 16-bit PCM,
 -- contains no speech, or is close enough already — callers then keep the
@@ -99,43 +126,75 @@ function VoiceVox.normalizeLoudness(wav)
     if not data_off or data_size < 2 then return nil end
     data_size = data_size - (data_size % 2)
     local last = data_off + data_size - 1
-    local floor_abs = 32768 * VoiceVox.NORMALIZE_FLOOR
-    local sum_sq, active, peak = 0, 0, 0
+    -- Pass 1: per-frame mean square (the byte chunks ARE the frames).
+    local frame_bytes = VoiceVox.NORMALIZE_FRAME * 2
+    local frames = {}
+    local peak = 0
     local i = data_off
     while i <= last do
-        local hi = math.min(i + 2047, last)
+        local hi = math.min(i + frame_bytes - 1, last)
         local bytes = { wav:byte(i, hi) }
+        local sum_sq, n = 0, 0
         for j = 1, #bytes, 2 do
             local s = bytes[j] + bytes[j + 1] * 256
             if s >= 32768 then s = s - 65536 end
             local a = s < 0 and -s or s
             if a > peak then peak = a end
-            if a > floor_abs then
-                sum_sq = sum_sq + s * s
-                active = active + 1
-            end
+            sum_sq = sum_sq + s * s
+            n = n + 1
         end
+        if n > 0 then frames[#frames + 1] = sum_sq / n end
         i = hi + 1
     end
-    if active == 0 or peak == 0 then return nil end
-    local rms = math.sqrt(sum_sq / active)
+    if peak == 0 or #frames == 0 then return nil end
+    -- Pass 2: the speech level = mean power of the frames that hold speech.
+    -- The floor is relative to the clip's own loudest frame, so a quiet
+    -- render is measured on its (quiet) speech instead of being skewed by a
+    -- fixed threshold; an absolute floor still drops digital silence.
+    local max_ms = 0
+    for _, ms in ipairs(frames) do
+        if ms > max_ms then max_ms = ms end
+    end
+    local rel = VoiceVox.NORMALIZE_FRAME_FLOOR
+    local silence = 32768 * VoiceVox.NORMALIZE_SILENCE
+    local floor_ms = math.max(max_ms * rel * rel, silence * silence)
+    local sum_ms, n_active = 0, 0
+    for _, ms in ipairs(frames) do
+        if ms >= floor_ms then
+            sum_ms = sum_ms + ms
+            n_active = n_active + 1
+        end
+    end
+    if n_active == 0 then return nil end
+    local rms = math.sqrt(sum_ms / n_active)
     local gain = 32768 * 10 ^ (VoiceVox.NORMALIZE_TARGET_DB / 20) / rms
     if gain > VoiceVox.NORMALIZE_MAX_GAIN then gain = VoiceVox.NORMALIZE_MAX_GAIN end
     if gain < VoiceVox.NORMALIZE_MIN_GAIN then gain = VoiceVox.NORMALIZE_MIN_GAIN end
-    local peak_cap = VoiceVox.NORMALIZE_PEAK * 32767 / peak
-    if gain > peak_cap then gain = peak_cap end
     if gain > 0.97 and gain < 1.03 then return nil end -- close enough already
+    -- Rewrite with the full gain; the few samples that would top the ceiling
+    -- are squashed into the knee..ceiling band instead of capping the gain
+    -- (so one hot peak can't keep the whole clip quiet) or clipping.
+    local ceiling = VoiceVox.NORMALIZE_PEAK * 32767
+    local knee = VoiceVox.NORMALIZE_KNEE * ceiling
+    local band = ceiling - knee
     local char = string.char
+    local floor_ = math.floor
     local out = { wav:sub(1, data_off - 1) }
     i = data_off
     while i <= last do
-        local hi = math.min(i + 2047, last)
+        local hi = math.min(i + frame_bytes - 1, last)
         local bytes = { wav:byte(i, hi) }
         local piece = {}
         for j = 1, #bytes, 2 do
             local s = bytes[j] + bytes[j + 1] * 256
             if s >= 32768 then s = s - 65536 end
-            s = math.floor(s * gain + 0.5)
+            local x = s * gain
+            if x > knee then
+                x = knee + band * tanh((x - knee) / band)
+            elseif x < -knee then
+                x = -(knee + band * tanh((-x - knee) / band))
+            end
+            s = floor_(x + 0.5)
             if s > 32767 then s = 32767 elseif s < -32768 then s = -32768 end
             if s < 0 then s = s + 65536 end
             piece[#piece + 1] = char(s % 256, (s - s % 256) / 256)

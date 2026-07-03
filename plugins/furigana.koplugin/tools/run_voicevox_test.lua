@@ -194,13 +194,24 @@ ns = samples_of(VoiceVox.normalizeLoudness(make_wav(loud)))
 check(ns[1] == -5000 and ns[2] == 5000,
     "very loud speech is attenuated (down to the min-gain clamp): " .. tostring(ns[2]))
 
-local sparse = {}
-for i = 1, 100 do sparse[i] = 0 end
-sparse[50], sparse[51] = 16384, -16384
-ns = samples_of(VoiceVox.normalizeLoudness(make_wav(sparse)))
-check(ns[1] == 0 and ns[49] == 0, "silence stays silent")
-check(ns[50] == 4096 and ns[51] == -4096,
-    "the gain is measured on the speech only, pauses don't skew it: " .. tostring(ns[50]))
+-- Pauses don't skew the measurement: a silence frame followed by a speech
+-- frame — only the speech frames set the gain (frame = NORMALIZE_FRAME samples).
+local F = VoiceVox.NORMALIZE_FRAME
+local pausey = {}
+for i = 1, F do pausey[i] = 0 end
+for i = F + 1, 2 * F do pausey[i] = (i % 2 == 0) and 8000 or -8000 end
+ns = samples_of(VoiceVox.normalizeLoudness(make_wav(pausey)))
+check(ns[1] == 0 and ns[F - 1] == 0, "silence stays silent")
+check((ns[F + 1] == 3277 or ns[F + 1] == -3277) and (ns[F + 2] == 3277 or ns[F + 2] == -3277),
+    "the gain is measured on the speech frames only, pauses don't skew it: " .. tostring(ns[F + 2]))
+
+-- Very quiet renders get the full (raised) gain — the old +12 dB ceiling left
+-- them audibly quieter than everything else.
+local faint = {}
+for i = 1, 200 do faint[i] = (i % 2 == 0) and 400 or -400 end
+ns = samples_of(VoiceVox.normalizeLoudness(make_wav(faint)))
+check(VoiceVox.NORMALIZE_MAX_GAIN >= 8 and ns[2] == 400 * VoiceVox.NORMALIZE_MAX_GAIN,
+    "very quiet speech gets up to the raised max gain: " .. tostring(ns[2]))
 
 local peaky = {}
 for i = 1, 200 do peaky[i] = (i % 2 == 0) and 2000 or -2000 end
@@ -212,7 +223,24 @@ for _, s in ipairs(ns) do
     if s > max_s then max_s = s end
 end
 check(max_s <= math.floor(VoiceVox.NORMALIZE_PEAK * 32767) + 1,
-    "a hot peak caps the gain so nothing clips: max " .. max_s)
+    "a hot peak is soft-limited under the ceiling, nothing clips: max " .. max_s)
+
+-- The old hard peak cap turned the gain down for the whole clip when a single
+-- sample ran hot, which kept whole sentences quiet. Now the body still gets
+-- (near) the full gain and only the peak is squashed.
+local hotbody = {}
+for i = 1, 3 * F do hotbody[i] = (i % 2 == 0) and 1500 or -1500 end
+hotbody[2 * F] = 30000
+ns = samples_of(VoiceVox.normalizeLoudness(make_wav(hotbody)))
+max_s = 0
+for _, s in ipairs(ns) do
+    if s < 0 then s = -s end
+    if s > max_s then max_s = s end
+end
+check(ns[2] > 2500,
+    "a lone hot peak no longer pins the whole clip quiet (old cap: ~1556): " .. tostring(ns[2]))
+check(max_s <= math.floor(VoiceVox.NORMALIZE_PEAK * 32767) + 1,
+    "…while the peak itself still stays under the ceiling: " .. max_s)
 
 local at_target = {}
 for i = 1, 200 do at_target[i] = (i % 2 == 0) and 3277 or -3277 end
@@ -244,6 +272,15 @@ written7 = f7:read("*a")
 f7:close()
 check(written7 == quiet_wav, "opts.normalize = false writes the raw engine audio")
 os.remove(out)
+
+-- ------------------------------------------------------------- cache tag ----
+-- Leveled and raw audio must never share a cache key; a version bump re-keys.
+check(VoiceVox.cacheTag({}) == "n" .. VoiceVox.NORMALIZE_VERSION,
+    "cacheTag: leveling on (default) carries the version: " .. VoiceVox.cacheTag({}))
+check(VoiceVox.cacheTag({ normalize = false }) == "",
+    "cacheTag: leveling off keeps the historic raw key")
+check(VoiceVox.cacheTag(nil) == "n" .. VoiceVox.NORMALIZE_VERSION,
+    "cacheTag: nil opts count as leveling on (fetch's default)")
 
 print(failures == 0 and "\nALL TESTS PASSED" or ("\n" .. failures .. " TEST(S) FAILED"))
 os.exit(failures == 0 and 0 or 1)

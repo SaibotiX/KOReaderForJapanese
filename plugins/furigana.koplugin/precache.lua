@@ -67,8 +67,25 @@ Precache.hash = hash_str
 --- Cache key for one synthesized text. This is the single source of truth for
 -- audio cache file names: main.lua's audioCachePathFor() uses it too, which is
 -- what makes precached files findable by speakText().
-function Precache.audioKey(url, speaker, text)
+function Precache.audioKey(url, speaker, text, tag)
+    if tag and tag ~= "" then
+        return hash_str(("%s|%s|%s|%s"):format(url, speaker, text, tag))
+    end
     return hash_str(("%s|%s|%s"):format(url, speaker, text))
+end
+
+--- The cache key for one text's audio under these fetch opts, including the
+-- loudness-leveling tag (see voicevox.cacheTag): leveled and raw files — or
+-- files leveled by a different algorithm version — must never masquerade for
+-- one another. Every runtime key computation goes through here, so all the
+-- caches (word, page precache, sentence) stay interchangeable.
+function Precache.audioKeyFor(opts, text)
+    local tag = ""
+    local ok, VoiceVox = pcall(require, "voicevox")
+    if ok and VoiceVox and VoiceVox.cacheTag then
+        tag = VoiceVox.cacheTag(opts)
+    end
+    return Precache.audioKey(opts and opts.url or "", opts and opts.speaker or "", text, tag)
 end
 
 -- Decode the UTF-8 codepoint starting at byte i. Returns cp, byte length.
@@ -266,7 +283,7 @@ function Precache.runWorker(cfg)
             Precache.writeManifest(mpath, words, cfg.tmp_suffix)
         end
         for _, w in ipairs(words) do
-            local key = Precache.audioKey(cfg.opts.url, cfg.opts.speaker, w)
+            local key = Precache.audioKeyFor(cfg.opts, w)
             if want[key] == nil then
                 want[key] = w
                 order[#order + 1] = key
