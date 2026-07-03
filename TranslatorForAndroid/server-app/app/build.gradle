@@ -1,0 +1,61 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.saibotix.translatorserver'
+    compileSdk 30
+    buildToolsVersion '34.0.0'
+
+    defaultConfig {
+        applicationId 'com.saibotix.translatorserver'
+        // llama-server is built against android-28 (posix_spawn), so older
+        // devices genuinely can't run it.
+        minSdk 28
+        targetSdk 28
+        versionCode 1
+        versionName '0.1.0 (LFM2-350M-ENJP-MT, llama.cpp)'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    signingConfigs {
+        release {
+            // Dev keystore committed next to the project so host and container
+            // builds sign identically and upgrades install in place.
+            storeFile rootProject.file('signing/translator.keystore')
+            storePassword 'translator-server'
+            keyAlias 'translator'
+            keyPassword 'translator-server'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    aaptOptions {
+        // The bundled GGUF is already quantized: store it uncompressed so the
+        // one-time extraction is a plain copy.
+        noCompress 'gguf'
+    }
+
+    packagingOptions {
+        // Extract .so files to disk: libllamaserver.so is really the
+        // llama-server *executable*, run from nativeLibraryDir (the only
+        // location Android allows exec from).
+        jniLibs { useLegacyPackaging = true }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}

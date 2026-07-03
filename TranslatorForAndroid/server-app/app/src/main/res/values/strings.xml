@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JA Translator Server</string>
+    <string name="start_server">Start server</string>
+    <string name="stop_server">Stop server</string>
+    <string name="autostart">Start automatically after boot</string>
+    <string name="battery_exempt_request">Disable battery optimization…</string>
+    <string name="battery_exempt_ok">Battery optimization already disabled ✓</string>
+    <string name="status_prefix">Status: </string>
+    <string name="credits">Offline Japanese→English translation for KOReader.
+Engine: llama.cpp (MIT) serving LiquidAI LFM2-350M-ENJP-MT
+(LFM Open License v1.0). The first start copies the 230 MB model
+out of the app, which takes a moment.
+In KOReader: Japanese → Local translation server →
+http://127.0.0.1:8087, then “Use the local translator”.</string>
+</resources>

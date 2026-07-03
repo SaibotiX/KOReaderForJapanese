@@ -1,0 +1,17 @@
+# upstream checkout (own .git; cloned by server-app/build-native.sh)
+native/
+
+# downloaded release artifacts (restored by server-app/fetch-artifacts.sh)
+artifacts/
+
+# dev signing key must stay committed (overrides the repo root *.keystore
+# rule) so builds from any machine upgrade in place on-device
+!server-app/signing/translator.keystore
+
+# staged big binaries + build output
+server-app/.gradle/
+server-app/build/
+server-app/app/build/
+server-app/local.properties
+server-app/app/src/main/assets/models/
+server-app/app/src/main/jniLibs/
