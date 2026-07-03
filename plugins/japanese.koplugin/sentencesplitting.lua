@@ -1,16 +1,23 @@
 --- Sentence splitting: read the book sentence by sentence with the volume keys.
 --
 -- While enabled, the page-turn keys (the volume buttons on Android) no longer
--- turn pages: the first press picks the current page's first sentence, speaks
--- it through VOICEVOX and shows it in a small popup right above the sentence
--- (below it when there is no room above; bottom of the screen when the
--- sentence cannot be located) — with furigana readings spliced in (toggleable)
--- and its translation underneath (Google Translate, toggleable, swapped in as
--- soon as it arrives; needs a network connection, unlike the audio, whose
--- engine may run on the device itself). Forward / back keys step to the next /
--- previous sentence; stepping past either end of the page turns it. A sentence
--- that runs across a page boundary is completed with the next page's
--- beginning, exactly like the auto reader.
+-- turn pages: each press steps to the next / previous sentence, marks its
+-- first character with a faint (crengine-selection) cursor, and — per the
+-- "On each step" toggles — speaks it through VOICEVOX and/or shows it in a
+-- small popup right above the sentence (below it when there is no room;
+-- bottom of the screen only when it cannot be located at all — shortened
+-- prefixes and occurrence counting locate it through inline formatting).
+-- The popup holds the sentence with furigana spliced in (toggleable; the
+-- Japanese line itself can be hidden to leave only the translation) and its
+-- translation underneath (local LLM server first when configured, Google
+-- otherwise; swapped in as soon as it arrives). Text on the popup can be
+-- hold-selected for a dictionary lookup. Stepping past either end of the
+-- page turns it; a sentence that runs across a page boundary is completed
+-- with the next page's beginning, exactly like the auto reader. A configured
+-- double press of a stepping key adjusts the media volume, stops/starts the
+-- feature, replays, toggles the translation, or turns a whole page; and the
+-- highlight dialog's "Read sentences from here" starts at any sentence
+-- (Controller:startAt).
 --
 -- Smoothness comes from working ahead: a single background subprocess keeps
 -- the audio AND the translation of the next two sentences cached (WAVs in the
@@ -48,6 +55,11 @@ SentenceSplitting.FETCH_DEADLINE_S = 150
 -- here rather than through GestureDetector's double_tap, which is usually
 -- disabled globally because it would delay every page-turn tap.
 SentenceSplitting.DOUBLE_TAP_S = 0.35
+-- Same idea for the stepping keys: with a double-press action configured
+-- (see Controller:onDoublePress), a second press of the same key within this
+-- window fires the action; the single step runs when the window passes.
+-- With the action set to "none" (the default) there is no delay at all.
+SentenceSplitting.DOUBLE_PRESS_S = 0.35
 
 -- djb2 hash -> 8 hex chars, same as the furigana plugin's cache keying.
 local function hash_str(s)
@@ -112,6 +124,101 @@ function SentenceSplitting.rubyDisplay(annotated, original)
     return ReadingExtractor.display(plain, runs, 0, #plain) or original
 end
 
+-- The first `n_chars` codepoints of a UTF-8 string.
+local function utf8_prefix(s, n_chars)
+    local i, count = 1, 0
+    while i <= #s and count < n_chars do
+        local _, len = Precache.utf8At(s, i)
+        i = i + len
+        count = count + 1
+    end
+    return s:sub(1, i - 1)
+end
+
+--- Progressively simpler search needles for locating a sentence on the page.
+-- crengine's findText only matches within a single text node, so newlines and
+-- inline formatting (bold, links, native ruby) inside the sentence break the
+-- full-text search; shorter prefixes of the first line are much more likely
+-- to sit in one node. Anchoring to the sentence's start is always right —
+-- the popup only needs to know where the sentence begins.
+function SentenceSplitting.anchorNeedles(sentence, carry_len)
+    local s = sentence or ""
+    if carry_len and carry_len > 0 then
+        s = s:sub(1, #s - carry_len)
+    end
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    local needles = {}
+    local function add(n)
+        n = n:gsub("^%s+", ""):gsub("%s+$", "")
+        if n ~= "" and n ~= needles[#needles] then
+            needles[#needles + 1] = n
+        end
+    end
+    if s == "" then return needles end
+    add(s)
+    local first_line = s:match("^[^\n]+")
+    if first_line then add(first_line) end
+    local line = needles[#needles] or s
+    for _, n_chars in ipairs({ 12, 6, 3 }) do
+        add(utf8_prefix(line, n_chars))
+    end
+    return needles
+end
+
+--- Byte positions (1-based) of each sentence within the page text, found by
+-- sequential plain search starting after the skipped carry head. Sentences
+-- are verbatim substrings of the text (the splitter only trims and caps
+-- them); the last one drops its carried-over completion first. A sentence
+-- that cannot be located gets nil (the search continues after the previous
+-- hit).
+function SentenceSplitting.sentencePositions(text, sents, skip, carry_len)
+    local out = {}
+    local pos = (skip or 0) + 1
+    for i = 1, #sents do
+        local s = sents[i]
+        if i == #sents and (carry_len or 0) > 0 then
+            s = s:sub(1, #s - carry_len)
+        end
+        local st = s ~= "" and text:find(s, pos, true) or nil
+        out[i] = st
+        if st then pos = st + #s end
+    end
+    return out
+end
+
+--- Which (1-based, non-overlapping) occurrence of `needle` within `text`
+-- is the one starting at (or right before) `sent_pos` — used to pick the
+-- matching hit among several findText results when a shortened needle
+-- appears earlier on the page too.
+function SentenceSplitting.occurrenceIndex(text, needle, sent_pos)
+    local count, from = 0, 1
+    while true do
+        local st = text:find(needle, from, true)
+        if not st or st >= sent_pos then break end
+        count = count + 1
+        from = st + #needle
+    end
+    return count + 1
+end
+
+--- The index of the sentence containing byte position `byte_pos` of the page
+-- text (the last sentence starting at or before it); 1 when it lies before
+-- every located sentence. Used by "read sentences from here".
+function SentenceSplitting.sentenceIndexAt(positions, sents, byte_pos)
+    local best = 1
+    for i = 1, #sents do
+        local st = positions[i]
+        if st then
+            if st <= byte_pos then
+                best = i
+            else
+                break
+            end
+        end
+    end
+    return best
+end
+
 -- --------------------------------------------------------------- controller --
 
 local Controller = {}
@@ -169,12 +276,46 @@ function Controller:pageText(page)
     return furigana:pageText(page)
 end
 
+-- ------------------------------------------------------- per-step actions --
+-- What a stepping key press does, besides moving the marker: any combination
+-- of audio, popup, Japanese sentence line (with furigana), and translation
+-- can be enabled — or none, which turns the keys into a pure sentence cursor
+-- for skipping around.
+
+function Controller:audioEnabled()
+    return G_reader_settings:nilOrTrue("language_japanese_sentence_audio")
+end
+
+function Controller:popupEnabled()
+    return G_reader_settings:nilOrTrue("language_japanese_sentence_popup")
+end
+
+--- Whether the popup shows the Japanese sentence itself; turned off, only the
+-- translation line remains (e.g. reading practice with an English safety net).
+function Controller:showJpEnabled()
+    return G_reader_settings:nilOrTrue("language_japanese_sentence_show_jp")
+end
+
 function Controller:furiganaEnabled()
     return G_reader_settings:nilOrTrue("language_japanese_sentence_furigana")
 end
 
 function Controller:translateEnabled()
     return G_reader_settings:nilOrTrue("language_japanese_sentence_translate")
+end
+
+--- The configured double-press action ("none" = plain stepping, no delay).
+function Controller:doublePressAction()
+    return G_reader_settings:readSetting("language_japanese_sentence_doublepress") or "none"
+end
+
+--- The local LLM translator's opts (nil when disabled): translations then try
+-- it before Google, and being offline no longer matters for them.
+function Controller:localTranslatorOpts()
+    if self.plugin.localTranslatorOpts then
+        return self.plugin:localTranslatorOpts()
+    end
+    return nil
 end
 
 --- Whether the device has a network connection. Translations need one; the
@@ -223,7 +364,7 @@ end
 function Controller:wavFor(text)
     local lfs = require("libs/libkoreader-lfs")
     local opts = self:voicevoxOpts()
-    local key = Precache.audioKey(opts.url, opts.speaker, text)
+    local key = Precache.audioKeyFor(opts, text)
     local cache_dir = self:furigana().cache_dir
     local candidates = {
         self:wavDir() .. "/" .. key .. ".wav",
@@ -338,12 +479,55 @@ function Controller:buildAt(page)
     local text = self:pageText(page) or ""
     local skip = page > 1 and SentenceSplitting.computeSkip(self:pageText(page - 1), text) or 0
     local sents, _, carry_len = SentenceSplitting.buildPage(text, self:pageText(page + 1) or "", skip)
-    return { page = page, sents = sents, idx = 0, carry_len = carry_len }
+    -- text/skip are kept for locating sentences on the page (anchor
+    -- disambiguation, "read sentences from here").
+    return { page = page, text = text, skip = skip, sents = sents, idx = 0, carry_len = carry_len }
 end
 
---- One key press: dir 1 = next sentence, -1 = previous. The first press of
--- either key starts at the current page's first sentence.
+--- Every stepping key press funnels through here (the reader-level KeyPress
+-- and the popup's own bindings). With a double-press action configured, the
+-- first press is held back for DOUBLE_PRESS_S: a second press of the same key
+-- within the window fires the action instead of two steps; a press of the
+-- other key flushes the held step first. With "none" (the default) presses
+-- step immediately.
 function Controller:onStep(dir)
+    if self:doublePressAction() == "none" then
+        return self:stepNow(dir)
+    end
+    local UIManager = require("ui/uimanager")
+    if self._pending_step_dir == dir then
+        UIManager:unschedule(self._pending_step_fn)
+        self._pending_step_dir = nil
+        return self:onDoublePress(dir)
+    end
+    if self._pending_step_dir ~= nil then
+        -- The other key: the held press was a real (single) step.
+        UIManager:unschedule(self._pending_step_fn)
+        local held = self._pending_step_dir
+        self._pending_step_dir = nil
+        self:stepNow(held)
+    end
+    self._pending_step_dir = dir
+    self._pending_step_fn = self._pending_step_fn or function()
+        local d = self._pending_step_dir
+        self._pending_step_dir = nil
+        if d then self:stepNow(d) end
+    end
+    UIManager:scheduleIn(SentenceSplitting.DOUBLE_PRESS_S, self._pending_step_fn)
+    return true
+end
+
+function Controller:cancelPendingStep()
+    if self._pending_step_dir == nil then return end
+    self._pending_step_dir = nil
+    if self._pending_step_fn then
+        require("ui/uimanager"):unschedule(self._pending_step_fn)
+    end
+end
+
+--- One step: dir 1 = next sentence, -1 = previous. The first press of
+-- either key starts at the current page's first sentence.
+function Controller:stepNow(dir)
     local p = self.plugin
     if not (p.ui and p.ui.rolling and p.ui.document) then return false end
     local _ = require("gettext")
@@ -378,6 +562,87 @@ function Controller:onStep(dir)
         if s.idx <= 1 then return self:seekPage(-1) end
         s.idx = s.idx - 1
     end
+    self:present()
+    return true
+end
+
+--- A double press of a stepping key. dir is the key's direction, so actions
+-- can be direction-aware (volume up/down, page forward/back).
+function Controller:onDoublePress(dir)
+    local action = self:doublePressAction()
+    if action == "volume" then
+        self:adjustVolume(dir)
+    elseif action == "toggle" then
+        -- Stop/disable ↔ enable lives in the plugin (it owns the setting and
+        -- the key bindings).
+        if self.plugin.onToggleSentenceSplitting then
+            self.plugin:onToggleSentenceSplitting()
+        end
+    elseif action == "replay" then
+        self:replay()
+    elseif action == "translation" then
+        self:toggleTranslation()
+    elseif action == "page" then
+        -- Jump a whole page without stepping through its sentences; the next
+        -- single press starts at the new page's first sentence.
+        self:reset()
+        self:flip(dir)
+    end
+    return true
+end
+
+--- Raise/lower the real media volume (double-press "volume" action):
+-- Android's AudioManager, with the system volume UI shown. jint arguments
+-- must cross the JNI varargs as int32_t cdata (plain Lua numbers would be
+-- promoted to double and land in the wrong registers).
+function Controller:adjustVolume(dir)
+    local _ = require("gettext")
+    local Device = require("device")
+    if not Device:isAndroid() then
+        self:notify(_("Volume control is only available on Android."), 2)
+        return
+    end
+    local ok, err = pcall(function()
+        local ffi = require("ffi")
+        local android = require("android")
+        android.jni:context(android.app.activity.vm, function(jni)
+            local svc = jni.env[0].NewStringUTF(jni.env, "audio")
+            local am = jni:callObjectMethod(android.app.activity.clazz,
+                "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", svc)
+            jni.env[0].DeleteLocalRef(jni.env, svc)
+            if am == nil then
+                error("no AudioManager")
+            end
+            -- STREAM_MUSIC = 3; ADJUST_RAISE = 1 / ADJUST_LOWER = -1;
+            -- FLAG_SHOW_UI = 1.
+            jni:callVoidMethod(am, "adjustStreamVolume", "(III)V",
+                ffi.new("int32_t", 3),
+                ffi.new("int32_t", dir > 0 and 1 or -1),
+                ffi.new("int32_t", 1))
+            jni.env[0].DeleteLocalRef(jni.env, am)
+        end)
+    end)
+    if not ok then
+        local logger = require("logger")
+        logger.warn("sentencesplitting: volume adjust failed:", err)
+    end
+end
+
+--- Start reading at the sentence containing byte position `byte_pos` of the
+-- current page's text (1-based, in the same extraction as pageText) — used by
+-- the highlight dialog's "read sentences from here". Builds a fresh session
+-- and presents that sentence. Returns true when something was presented.
+function Controller:startAt(byte_pos)
+    local cur = self:curPage()
+    if not cur then return false end
+    self.session = self:buildAt(cur)
+    local s = self.session
+    if #s.sents == 0 then
+        self:notify(require("gettext")("No sentence found on this page."), 2)
+        return false
+    end
+    local positions = SentenceSplitting.sentencePositions(s.text, s.sents, s.skip, s.carry_len)
+    s.idx = SentenceSplitting.sentenceIndexAt(positions, s.sents, byte_pos or 1)
     self:present()
     return true
 end
@@ -430,82 +695,190 @@ end
 -- --------------------------------------------------------------- presenting --
 
 --- Screen rectangle of the current sentence (the union of its rendered line
--- boxes), used to anchor the popup right above it. The sentence is located
--- with crengine's text search, scoped to the current page (a page-spanning
--- sentence is looked up by its on-page part). Returns nil when the text can't
--- be found in one piece — crengine's search matches within a single text
--- node, so inline formatting inside the sentence breaks it — and the popup
--- then falls back to the bottom of the screen.
+-- boxes), used to anchor the popup right above it, plus the xpointer of the
+-- match's start (the marker sits there). The sentence is located with
+-- crengine's text search, scoped to the current page (a page-spanning
+-- sentence is looked up by its on-page part). crengine only matches within a
+-- single text node, so when the full sentence can't be found in one piece
+-- (newlines, inline formatting, native ruby) progressively shorter prefixes
+-- are tried; a shortened needle occurring more than once on the page is
+-- disambiguated by counting occurrences in the page text. Returns nil only
+-- when nothing at all can be located — the popup then falls back to the
+-- bottom of the screen.
 function Controller:sentenceAnchor()
     local s = self.session
     local doc = self.plugin.ui.document
     if not (doc and doc.findText and doc.getScreenBoxesFromPositions) then return nil end
-    local needle = s.sents[s.idx]
-    if s.idx == #s.sents and (s.carry_len or 0) > 0 then
-        needle = needle:sub(1, #needle - s.carry_len)
-    end
-    needle = needle:gsub("^%s+", ""):gsub("%s+$", "")
-    if needle == "" then return nil end
     local cur = self:curPage()
-    -- origin 0, forward: search from the top of the current page. findText
-    -- never moves the view, but it does set crengine's selection highlight —
-    -- clear it before anything repaints.
-    local ok, sel = pcall(doc.findText, doc, needle, 0, 0, false, cur, false, 8)
-    pcall(doc.clearSelection, doc)
-    if not (ok and type(sel) == "table" and sel[1] and sel[1].start) then return nil end
-    local ok_page, hit_page = pcall(doc.getPageFromXPointer, doc, sel[1].start)
-    if not ok_page or hit_page ~= cur then return nil end -- found beyond this page only
-    local ok_boxes, boxes = pcall(doc.getScreenBoxesFromPositions, doc,
-        sel[1].start, sel[1]["end"], true)
-    if not (ok_boxes and type(boxes) == "table" and boxes[1]) then return nil end
-    -- The union of the line boxes: "above" clears the sentence's first line
-    -- and the below-fallback starts past its last one.
-    local x0, y0, x1, y1
-    for _, b in ipairs(boxes) do
-        if b.w and b.h and b.h > 0 then
-            if not x0 or b.x < x0 then x0 = b.x end
-            if not y0 or b.y < y0 then y0 = b.y end
-            if not x1 or b.x + b.w > x1 then x1 = b.x + b.w end
-            if not y1 or b.y + b.h > y1 then y1 = b.y + b.h end
+    local carry = s.idx == #s.sents and s.carry_len or 0
+    local positions -- computed lazily, only when disambiguation is needed
+    for _, needle in ipairs(SentenceSplitting.anchorNeedles(s.sents[s.idx], carry)) do
+        -- origin 0, forward: search from the top of the current page.
+        -- findText never moves the view, but it does set crengine's selection
+        -- highlight — clear it before anything repaints.
+        local ok, sel = pcall(doc.findText, doc, needle, 0, 0, false, cur, false, 16)
+        pcall(doc.clearSelection, doc)
+        if ok and type(sel) == "table" and sel[1] and sel[1].start then
+            local hit = sel[1]
+            if #sel > 1 and s.text and s.text ~= "" then
+                -- Several hits on/after this page: ours is the occurrence at
+                -- this sentence's own position in the page text.
+                if positions == nil then
+                    positions = SentenceSplitting.sentencePositions(
+                        s.text, s.sents, s.skip, s.carry_len)
+                end
+                local sent_pos = positions[s.idx]
+                if sent_pos then
+                    local n = SentenceSplitting.occurrenceIndex(s.text, needle, sent_pos)
+                    hit = sel[math.min(n, #sel)] or hit
+                end
+            end
+            local ok_page, hit_page = pcall(doc.getPageFromXPointer, doc, hit.start)
+            if ok_page and hit_page == cur then
+                local ok_boxes, boxes = pcall(doc.getScreenBoxesFromPositions, doc,
+                    hit.start, hit["end"], true)
+                if ok_boxes and type(boxes) == "table" and boxes[1] then
+                    -- The union of the line boxes: "above" clears the
+                    -- sentence's first line and the below-fallback starts
+                    -- past its last one.
+                    local x0, y0, x1, y1
+                    for _, b in ipairs(boxes) do
+                        if b.w and b.h and b.h > 0 then
+                            if not x0 or b.x < x0 then x0 = b.x end
+                            if not y0 or b.y < y0 then y0 = b.y end
+                            if not x1 or b.x + b.w > x1 then x1 = b.x + b.w end
+                            if not y1 or b.y + b.h > y1 then y1 = b.y + b.h end
+                        end
+                    end
+                    if x0 then
+                        local Geom = require("ui/geometry")
+                        return Geom:new{ x = x0, y = y0, w = x1 - x0, h = y1 - y0 },
+                            hit.start
+                    end
+                end
+            end
         end
     end
-    if not x0 then return nil end
-    local Geom = require("ui/geometry")
-    return Geom:new{ x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+    return nil
 end
 
---- Show the current sentence: popup anchored above it (furigana per toggle,
--- translation when cached), audio (cached plays at once, otherwise fetched
--- with priority), and keep the lookahead warm.
+-- ------------------------------------------------------------------ marker --
+
+--- Faintly mark the current sentence's first character (crengine's native
+-- text selection), so the reader always sees where the stepper sits — with
+-- the popup and audio switched off this is the only feedback. The previous
+-- marker is replaced; reset()/stop() clears it.
+function Controller:setMarker(start_xp)
+    local doc = self.plugin.ui and self.plugin.ui.document
+    if not doc then return end
+    pcall(doc.clearSelection, doc) -- previous marker (or stray selection) off
+    local prev = self._marker_dimen
+    local dimen
+    if start_xp and doc.getNextVisibleChar and doc.getTextFromXPointers then
+        local ok_next, xp_end = pcall(doc.getNextVisibleChar, doc, start_xp)
+        if ok_next and xp_end and xp_end ~= start_xp then
+            -- draw_selection = true: crengine renders its selection there.
+            local drawn = pcall(doc.getTextFromXPointers, doc, start_xp, xp_end, true)
+            if drawn and doc.getScreenBoxesFromPositions then
+                local ok_b, boxes = pcall(doc.getScreenBoxesFromPositions, doc,
+                    start_xp, xp_end, true)
+                if ok_b and type(boxes) == "table" and boxes[1] and boxes[1].w then
+                    local Geom = require("ui/geometry")
+                    dimen = Geom:new{ x = boxes[1].x, y = boxes[1].y,
+                        w = boxes[1].w, h = boxes[1].h }
+                end
+            end
+        end
+    end
+    self._marker_dimen = dimen
+    self:repaintMarker(prev, dimen)
+end
+
+function Controller:clearMarker()
+    if not self._marker_dimen then return end
+    local doc = self.plugin.ui and self.plugin.ui.document
+    if doc then pcall(doc.clearSelection, doc) end
+    local prev = self._marker_dimen
+    self._marker_dimen = nil
+    self:repaintMarker(prev, nil)
+end
+
+-- Repaint the spots the marker left and entered (crengine draws into the
+-- page, so the reader view must redraw those regions).
+function Controller:repaintMarker(a, b)
+    local x0, y0, x1, y1
+    for _, r in ipairs({ a, b }) do
+        if r then
+            if not x0 then
+                x0, y0, x1, y1 = r.x, r.y, r.x + r.w, r.y + r.h
+            else
+                x0 = math.min(x0, r.x)
+                y0 = math.min(y0, r.y)
+                x1 = math.max(x1, r.x + r.w)
+                y1 = math.max(y1, r.y + r.h)
+            end
+        end
+    end
+    if not x0 then return end
+    local Geom = require("ui/geometry")
+    local region = Geom:new{ x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+    local UIManager = require("ui/uimanager")
+    UIManager:setDirty(nil, function()
+        return "ui", region
+    end)
+end
+
+--- Present the current sentence: always move the first-character marker; the
+-- rest — popup (Japanese line with furigana, translation) and audio — runs
+-- per the per-step action toggles. With everything off the keys are a pure
+-- sentence cursor: the marker alone shows where the stepper sits, and
+-- nothing is fetched.
 function Controller:present()
     local s = self.session
     local text = s.sents[s.idx]
     self.token = self.token + 1
     self._await_play = nil
     self:cancelPendingTap() -- a tap on the previous popup must not fire here
-    local display = text
-    if self:furiganaEnabled() then
-        display = self:annotate(text)
+
+    local ok_anchor, anchor, start_xp = pcall(self.sentenceAnchor, self)
+    if not ok_anchor then
+        anchor, start_xp = nil, nil
     end
-    s.display = display
-    local ok_anchor, anchor = pcall(self.sentenceAnchor, self)
-    s.anchor = ok_anchor and anchor or nil
-    local tr
-    if self:translateEnabled() and self.tr_visible then
-        tr = self:cachedTranslation(text)
-        -- The audio may well come from an on-device engine, so being offline
-        -- is not obvious: say once why the translation line stays missing.
-        if not tr and not self._tr_notified and not self:isOnline() then
-            self._tr_notified = true
-            self:notify(require("gettext")("No network — sentence translations are unavailable."), 3)
+    s.anchor = anchor
+    self:setMarker(start_xp)
+
+    local display
+    if self:showJpEnabled() then
+        display = self:furiganaEnabled() and self:annotate(text) or text
+    end
+    s.display = display -- nil when the Japanese line is switched off
+
+    if self:popupEnabled() then
+        local tr
+        if self:translateEnabled() and self.tr_visible then
+            tr = self:cachedTranslation(text)
+            -- The audio may well come from an on-device engine, so being
+            -- offline is not obvious: say once why the translation line
+            -- stays missing (the local translator doesn't need a network).
+            if not tr and not self._tr_notified and not self:isOnline()
+                    and not self:localTranslatorOpts() then
+                self._tr_notified = true
+                self:notify(require("gettext")("No network — sentence translations are unavailable."), 3)
+            end
         end
+        self:showPopup(display, tr)
+    elseif self.popup then
+        require("ui/uimanager"):close(self.popup)
+        self.popup = nil
     end
-    self:showPopup(display, tr)
-    local wav, exists = self:wavFor(text)
-    if exists then
-        self:play(wav)
-    else
-        self._await_play = text
+
+    if self:audioEnabled() then
+        local wav, exists = self:wavFor(text)
+        if exists then
+            self:play(wav)
+        else
+            self._await_play = text
+        end
     end
     self:kickFetch()
 end
@@ -527,14 +900,24 @@ function Controller:showPopup(display, tr)
     if self.popup then
         UIManager:close(self.popup)
     end
+    -- display may be nil (Japanese line switched off): translation-only
+    -- popups are fine, and "…" stands in while the translation is still on
+    -- its way.
+    local text
+    if display and tr then
+        text = display .. "\n" .. tr
+    else
+        text = display or tr or "…"
+    end
     local popup
     popup = SentencePopup:new{
-        text = tr and (display .. "\n" .. tr) or display,
+        text = text,
         anchor_box = self.session and self.session.anchor or nil,
         next_seq = self:seqFor(1),
         prev_seq = self:seqFor(-1),
         on_step = function(dir) self:onStep(dir) end,
         on_frame_tap = function() self:onPopupTap() end,
+        on_text_select = function(sel_text) self:lookupSelection(sel_text) end,
         close_callback = function()
             if self.popup == popup then self.popup = nil end
         end,
@@ -543,6 +926,18 @@ function Controller:showPopup(display, tr)
     self.popup_token = self.token
     self.popup_has_tr = tr ~= nil
     UIManager:show(popup)
+end
+
+--- Text selected (hold + drag) inside the popup: look it up in the
+-- dictionary, like selecting text in the dictionary window itself does.
+function Controller:lookupSelection(text)
+    if type(text) ~= "string" or text == "" then return end
+    local ui = self.plugin.ui
+    if not (ui and ui.dictionary and ui.dictionary.onLookupWord) then return end
+    local ok, cleaned = pcall(function()
+        return require("util").cleanupSelectedText(text)
+    end)
+    ui.dictionary:onLookupWord(ok and cleaned or text, true)
 end
 
 function Controller:play(wav)
@@ -649,12 +1044,20 @@ function Controller:wants()
     if not (s and s.idx > 0) then return nil end
     local lfs = require("libs/libkoreader-lfs")
     local opts = self:voicevoxOpts()
-    -- Translations are only worth attempting online (the tries would just be
-    -- burned); once the network is back, the next step resumes fetching.
-    local want_tr = self:translateEnabled() and self:isOnline()
+    -- Translations only matter while the popup shows them, and are only worth
+    -- attempting online (the tries would just be burned) — unless the local
+    -- translator is on: 127.0.0.1 doesn't need a network. Once the network is
+    -- back, the next step resumes fetching.
+    local want_tr = self:translateEnabled() and self:popupEnabled()
+        and (self:isOnline() or self:localTranslatorOpts() ~= nil)
+    -- Audio is prefetched only while the audio step-action is on; an explicit
+    -- replay request (_await_play) is honored regardless.
+    local want_audio = opts.url ~= "" and (self:audioEnabled() or self._await_play ~= nil)
     local w = { translations = {} }
     for i, text in ipairs(self:lookaheadTexts()) do
-        if opts.url ~= "" and not w.wav and (self.wav_tries[text] or 0) < SentenceSplitting.MAX_TRIES then
+        if want_audio and not w.wav
+                and (self:audioEnabled() or text == self._await_play)
+                and (self.wav_tries[text] or 0) < SentenceSplitting.MAX_TRIES then
             local wav, exists = self:wavFor(text)
             if not exists then
                 w.wav = { text = text, out = wav, current = (i == 1) }
@@ -704,6 +1107,7 @@ function Controller:kickFetch()
         wav = w.wav,
         translations = w.translations,
         lang = self:targetLang(),
+        local_tr = self:localTranslatorOpts(), -- nil: Google only
         opts = {
             url = vv.url,
             speaker = vv.speaker,
@@ -716,11 +1120,24 @@ function Controller:kickFetch()
         -- Translations first (small, fast), then the one WAV; each lands
         -- atomically (tmp + rename), so a kill can't leave partial files.
         for _, t in ipairs(job.translations) do
-            local ok, tr = pcall(function()
-                local Translator = require("ui/translator")
-                return Translator:translate(t.text, job.lang, "ja")
-            end)
-            if ok and type(tr) == "string" and tr ~= "" and tr ~= t.text then
+            local tr
+            if job.local_tr then
+                -- The local LLM first (offline-capable, better literary
+                -- register); Google only as the fallback.
+                local ok, res = pcall(function()
+                    local LocalTranslator = require("localtranslator")
+                    return LocalTranslator.translate(job.local_tr, t.text)
+                end)
+                if ok and type(res) == "string" and res ~= "" then tr = res end
+            end
+            if not tr then
+                local ok, res = pcall(function()
+                    local Translator = require("ui/translator")
+                    return Translator:translate(t.text, job.lang, "ja")
+                end)
+                if ok and type(res) == "string" and res ~= "" then tr = res end
+            end
+            if tr and tr ~= t.text then
                 local tmp = t.out .. ".tmp" .. tostring(child_pid)
                 local fh = io.open(tmp, "w")
                 if fh then
@@ -843,6 +1260,8 @@ function Controller:reset()
     self.token = self.token + 1
     self._await_play = nil
     self:cancelPendingTap()
+    self:cancelPendingStep()
+    self:clearMarker()
     self.session = nil
     if self.fetch then
         ffiutil.terminateSubProcess(self.fetch.pid)

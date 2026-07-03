@@ -41,6 +41,8 @@ local SentencePopup = InputContainer:extend{
     on_step = nil,    -- function(dir) — step to the next/previous sentence
     on_frame_tap = nil, -- every tap on the bubble body (the controller
                         -- decides single = toggle translation / double = replay)
+    on_text_select = nil, -- function(text) — text selected (hold + drag) on
+                          -- the bubble, for dictionary lookups
     close_callback = nil,
 }
 
@@ -56,9 +58,32 @@ function SentencePopup:init()
             w = Screen:getWidth(),
             h = Screen:getHeight(),
         }
+        -- Holds are scoped to the bubble, so text selection on the page
+        -- beneath keeps working; the zero rect stands in until first paint.
+        local frame_range = function()
+            return (self.frame and self.frame.dimen)
+                or Geom:new{ x = 0, y = 0, w = 0, h = 0 }
+        end
+        local hold_pan_rate = G_reader_settings:readSetting("hold_pan_rate")
+        if not hold_pan_rate then
+            hold_pan_rate = Screen.low_pan_rate and 5.0 or 30.0
+        end
         self.ges_events = {
             Tap = { GestureRange:new{ ges = "tap", range = fullscreen } },
             SwipeDismiss = { GestureRange:new{ ges = "swipe", range = fullscreen } },
+            -- Hold + drag selects text on the bubble (TextBoxWidget handles
+            -- the selection; the release hands us the selected text — the
+            -- same wiring as the dictionary window's definition).
+            HoldStartText = { GestureRange:new{ ges = "hold", range = frame_range } },
+            HoldPanText = { GestureRange:new{ ges = "hold_pan", range = frame_range, rate = hold_pan_rate } },
+            HoldReleaseText = {
+                GestureRange:new{ ges = "hold_release", range = frame_range },
+                args = function(text, hold_duration) -- luacheck: ignore 212
+                    if self.on_text_select then
+                        self.on_text_select(text)
+                    end
+                end,
+            },
         }
     end
     local face = Font:getFace("cfont", G_reader_settings:readSetting("dict_font_size") or 20)

@@ -48,6 +48,7 @@ local UIManager = {
         if w and w.close_callback then w.close_callback() end
     end,
     nextTick = function(_, fn) queue[#queue + 1] = fn end,
+    setDirty = function() end,
 }
 local function pump(max)
     for _ = 1, max or 200 do
@@ -83,7 +84,12 @@ local stubs = {
     ["ui/widget/infomessage"] = { new = function(_, o) return o end },
     ["device"] = { isAndroid = function() return false end },
     ["logger"] = { dbg = function() end, info = function() end, warn = function() end, err = function() end },
-    ["util"] = { makePath = function(d) os.execute("mkdir -p '" .. d .. "'") end },
+    ["util"] = {
+        makePath = function(d) os.execute("mkdir -p '" .. d .. "'") end,
+        cleanupSelectedText = function(s)
+            return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+        end,
+    },
     ["datastorage"] = { getDataDir = function() return TMP end },
     ["ffi/util"] = {
         template = function(s, a) return (s:gsub("%%1", tostring(a or ""))) end,
@@ -488,6 +494,269 @@ ctrl:onKeyPress(fake_key("LPgFwd"))
 check(popups[#popups].text:find("EN:", 1, true) == nil,
     "the hidden choice persists to the following sentence")
 pump()
+
+-- ================== pure helpers: anchoring & positions ===================
+
+local needles = SS.anchorNeedles("最初の行です。\n二行目のテキスト。", 0)
+check(needles[1] == "最初の行です。\n二行目のテキスト。" and needles[2] == "最初の行です。",
+    "anchorNeedles: full sentence first, then the first line")
+check(#needles == 4 and needles[#needles] == "最初の",
+    "anchorNeedles: progressively shorter first-line prefixes, down to 3 chars")
+check(#SS.anchorNeedles("あ", 0) == 1 and SS.anchorNeedles("あ", 0)[1] == "あ",
+    "anchorNeedles: a short sentence yields just itself")
+check(SS.anchorNeedles("ページ跨ぎの文です続き", #"続き")[1] == "ページ跨ぎの文です",
+    "anchorNeedles: the carried-over completion is trimmed first")
+
+local ptext = "犬。猫。犬。"
+local psents = { "犬。", "猫。", "犬。" }
+local pos_list = SS.sentencePositions(ptext, psents, 0, 0)
+check(pos_list[1] == 1 and pos_list[2] == #"犬。" + 1 and pos_list[3] == #"犬。猫。" + 1,
+    "sentencePositions: sequential find locates repeated sentences in order")
+check(SS.occurrenceIndex(ptext, "犬。", pos_list[3]) == 2
+    and SS.occurrenceIndex(ptext, "犬。", 1) == 1,
+    "occurrenceIndex counts non-overlapping earlier occurrences")
+check(SS.sentenceIndexAt(pos_list, psents, 1) == 1
+    and SS.sentenceIndexAt(pos_list, psents, pos_list[2]) == 2
+    and SS.sentenceIndexAt(pos_list, psents, #ptext) == 3,
+    "sentenceIndexAt maps byte offsets to their sentence")
+local pos_skip = SS.sentencePositions("XX犬。猫。", { "犬。", "猫。" }, 2, 0)
+check(pos_skip[1] == 3 and pos_skip[2] == 3 + #"犬。",
+    "sentencePositions starts searching after the skipped carry head")
+
+-- ===================== marker on the first character ======================
+
+local marker_draws = {}
+local orig_findText = doc.findText
+local orig_boxes = doc.getScreenBoxesFromPositions
+doc.getNextVisibleChar = function(_, xp) return xp .. "+" end
+doc.getTextFromXPointers = function(_, a, b, draw)
+    if draw then marker_draws[#marker_draws + 1] = { a, b } end
+    return ""
+end
+
+pages[1] = page1
+current_page = 1
+ctrl:reset()
+marker_draws = {}
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(#marker_draws >= 1 and marker_draws[#marker_draws][1] == "xp_hit_start"
+    and marker_draws[#marker_draws][2] == "xp_hit_start+",
+    "each step draws the marker on the sentence's first character")
+check(ctrl._marker_dimen ~= nil, "the marker region is remembered for repaint")
+pump()
+ctrl:reset()
+check(ctrl._marker_dimen == nil, "reset clears the marker")
+
+-- ================== anchor fallback & disambiguation ======================
+
+-- The full sentence can't be found in one piece (inline formatting): a
+-- shortened prefix still anchors the popup.
+local fmt_sent = "書式の入った長い文章です。"
+pages[1] = fmt_sent .. "残り。"
+doc.findText = function(_, pattern)
+    find_calls[#find_calls + 1] = pattern
+    if pattern == fmt_sent then return nil end
+    return { { start = "xp_hit_start", ["end"] = "xp_hit_end" } }, 1
+end
+current_page = 1
+ctrl:reset()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(popups[#popups].anchor_box ~= nil,
+    "an unfindable full sentence falls back to a prefix anchor (no bottom popup)")
+check(find_calls[#find_calls] ~= fmt_sent,
+    "…found via a shortened needle: " .. tostring(find_calls[#find_calls]))
+pump()
+
+-- A shortened needle occurring twice on the page anchors by occurrence.
+pages[1] = "犬が好き。犬が好きだ。"
+doc.findText = function(_, pattern)
+    find_calls[#find_calls + 1] = pattern
+    if pattern ~= "犬が好" then return nil end
+    return {
+        { start = "xp_first", ["end"] = "xp_first_end" },
+        { start = "xp_second", ["end"] = "xp_second_end" },
+    }, 2
+end
+local box_y = { xp_first = 100, xp_second = 300 }
+doc.getScreenBoxesFromPositions = function(_, s0)
+    return { { x = 50, y = box_y[s0] or 400, w = 200, h = 30 } }
+end
+current_page = 1
+ctrl:reset()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(popups[#popups].anchor_box.y == 100,
+    "repeated needle: sentence 1 anchors at the first hit")
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(popups[#popups].anchor_box.y == 300,
+    "repeated needle: sentence 2 anchors at its own (second) occurrence")
+pump()
+doc.findText = orig_findText
+doc.getScreenBoxesFromPositions = orig_boxes
+
+-- ======================= per-step action toggles ==========================
+
+ctrl.tr_visible = true -- earlier scenarios hid the translation line
+
+-- Audio off: stepping is silent and fetches nothing; an explicit double tap
+-- still fetches and plays on demand.
+settings.language_japanese_sentence_audio = false
+pages[3] = "音声なしの文。"
+current_page = 3
+ctrl:stop()
+local fetches_b4 = #fetched_texts
+played_before = #played
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(#fetched_texts == fetches_b4 and #played == played_before,
+    "audio toggled off: nothing is synthesized or played on step")
+check(popups[#popups].text:find("音声なしの文。", 1, true) ~= nil,
+    "…while the popup still shows")
+popups[#popups].on_frame_tap()
+popups[#popups].on_frame_tap()
+pump(500)
+check(#fetched_texts > fetches_b4 and #played > played_before,
+    "audio off: a double tap still fetches and plays on demand")
+settings.language_japanese_sentence_audio = nil
+
+-- Japanese line off: only the translation shows in the popup.
+settings.language_japanese_sentence_show_jp = false
+pages[3] = "日本語非表示の文。"
+current_page = 3
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(popups[#popups].text == "…",
+    "JP line off: a placeholder holds the popup until the translation lands")
+pump(500)
+check(popups[#popups].text == "EN:日本語非表示の文。",
+    "JP line off: only the translation appears in the popup")
+settings.language_japanese_sentence_show_jp = nil
+
+-- Popup off: no bubble, but the marker still moves; with audio also off the
+-- keys are a pure cursor and nothing at all is fetched.
+settings.language_japanese_sentence_popup = false
+pages[3] = "ポップアップなしの文。"
+current_page = 3
+ctrl:stop()
+local pops_b4 = #popups
+marker_draws = {}
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(#popups == pops_b4, "popup toggled off: no bubble is shown")
+check(#marker_draws >= 1, "…but the marker still moves")
+settings.language_japanese_sentence_audio = false
+pages[3] = "カーソルのみの文。"
+current_page = 3
+ctrl:stop()
+fetches_b4 = #fetched_texts
+local tr_b4 = #tr_calls
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(#fetched_texts == fetches_b4 and #tr_calls == tr_b4,
+    "pure cursor (popup+audio off): nothing is fetched at all")
+settings.language_japanese_sentence_audio = nil
+settings.language_japanese_sentence_popup = nil
+
+-- ========================== double press ==================================
+
+settings.language_japanese_sentence_doublepress = "toggle"
+local toggles = 0
+plugin.onToggleSentenceSplitting = function() toggles = toggles + 1 end
+pages[3] = "甲の文。乙の文。丙の文。"
+current_page = 3
+ctrl:stop()
+pops_b4 = #popups
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(#popups == pops_b4,
+    "with a double-press action configured, a single press is held back")
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(toggles == 1 and #popups == pops_b4,
+    "a second press within the window fires the action instead of stepping")
+pump(500)
+check(#popups == pops_b4, "…and the held step never runs")
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500) -- the double-press window elapses
+check(#popups > pops_b4 and popups[#popups].text:find("甲の文。", 1, true) ~= nil,
+    "a lone press steps once the window passes")
+pops_b4 = #popups
+ctrl:onKeyPress(fake_key("LPgFwd"))
+ctrl:onKeyPress(fake_key("LPgBack"))
+check(#popups == pops_b4 + 1,
+    "the other key flushes the held step immediately")
+pump(500)
+check(#popups == pops_b4 + 2,
+    "…and then steps itself when its own window passes")
+settings.language_japanese_sentence_doublepress = nil
+plugin.onToggleSentenceSplitting = nil
+
+-- ======================= start at a byte offset ===========================
+
+pages[1] = "一文目。二文目。三文目。"
+current_page = 1
+ctrl:stop()
+ctrl:startAt(#"一文目。" + 2) -- a byte inside the second sentence
+check(ctrl.session ~= nil and ctrl.session.idx == 2
+    and popups[#popups].text:find("二文目。", 1, true) ~= nil,
+    "startAt lands on the sentence containing the byte offset")
+pump()
+
+-- ================= popup text selection → dictionary ======================
+
+local dict_lookups = {}
+ui.dictionary = {
+    onLookupWord = function(_, word) dict_lookups[#dict_lookups + 1] = word end,
+}
+popups[#popups].on_text_select("  二文目 ")
+check(dict_lookups[1] == "二文目",
+    "text selected on the popup is cleaned and looked up in the dictionary")
+
+-- ======================= local translator first ===========================
+
+local local_calls = {}
+local local_fail = false
+package.preload["localtranslator"] = function()
+    return {
+        translate = function(opts, text)
+            local_calls[#local_calls + 1] = { url = opts.url, text = text }
+            if local_fail then return nil, "down" end
+            return "LOCAL:" .. text
+        end,
+    }
+end
+plugin.localTranslatorOpts = function()
+    return { url = "http://loc:8087" }
+end
+pages[3] = "ローカル翻訳の文。"
+current_page = 3
+ctrl:stop()
+local tr_google_b4 = #tr_calls
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(#local_calls >= 1 and local_calls[1].url == "http://loc:8087",
+    "the local translator is tried first for sentence translations")
+check(#tr_calls == tr_google_b4, "…Google is not called when it succeeds")
+check(popups[#popups].text:find("LOCAL:ローカル翻訳の文。", 1, true) ~= nil,
+    "…and its translation lands in the popup")
+
+local_fail = true
+pages[3] = "フォールバックの文。"
+current_page = 3
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(popups[#popups].text:find("EN:フォールバックの文。", 1, true) ~= nil,
+    "local server down: the Google fallback still translates")
+local_fail = false
+
+net.online = false
+pages[3] = "オフラインローカルの文。"
+current_page = 3
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(popups[#popups].text:find("LOCAL:オフラインローカルの文。", 1, true) ~= nil,
+    "offline with the local translator: translations keep working")
+net.online = true
+plugin.localTranslatorOpts = nil
 
 -- toggle off restores the keys
 ctrl:applyKeys(false)

@@ -63,6 +63,7 @@ function Japanese:init()
     if self.ui and self.ui.dictionary and self.ui.dictionary.addToDictButtons then
         self:registerDictButton()
     end
+    self:registerSentenceStartButton()
 end
 
 function Japanese:supportsLanguage(language_code)
@@ -721,6 +722,169 @@ function Japanese:onCloseDocument()
     end
 end
 
+--- The double-press action picker (radio submenu).
+function Japanese:genDoublePressMenu()
+    local choices = {
+        { id = "none", text = _("Nothing (step immediately, no delay)") },
+        { id = "volume", text = _("Media volume up / down (Android)") },
+        { id = "toggle", text = _("Stop / start sentence reading") },
+        { id = "replay", text = _("Replay the sentence audio") },
+        { id = "translation", text = _("Show / hide the translation") },
+        { id = "page", text = _("Turn a whole page forward / back") },
+    }
+    local items = {}
+    for _, choice in ipairs(choices) do
+        items[#items + 1] = {
+            text = choice.text,
+            radio = true,
+            checked_func = function()
+                return (G_reader_settings:readSetting("language_japanese_sentence_doublepress") or "none")
+                    == choice.id
+            end,
+            callback = function()
+                G_reader_settings:saveSetting("language_japanese_sentence_doublepress",
+                    choice.id ~= "none" and choice.id or nil)
+            end,
+        }
+    end
+    return items
+end
+
+-- ------------------------------------------------------- local translation --
+-- Offline JA→EN through a local OpenAI-compatible LLM server — llama.cpp
+-- serving LiquidAI's LFM2-350M-ENJP-MT (a 350M-parameter model tuned solely
+-- for JA↔EN translation; ~230 MB, redistributable license, llama-server
+-- speaks the API out of the box). Run it on the PC with
+-- tools/lfm2-translate-serve.sh, or on the device once a companion app à la
+-- VoiceVoxForAndroid serves it on 127.0.0.1. When enabled, every sentence
+-- translation tries this server first and only falls back to Google.
+
+function Japanese:isLocalTranslateEnabled()
+    return G_reader_settings:isTrue("language_japanese_local_translate")
+end
+
+--- The local-translator opts for fetch jobs; nil when the feature is off
+-- (callers then go straight to Google).
+function Japanese:localTranslatorOpts()
+    if not self:isLocalTranslateEnabled() then return nil end
+    local LocalTranslator = require("localtranslator")
+    return {
+        url = G_reader_settings:readSetting("language_japanese_local_tr_url")
+            or LocalTranslator.DEFAULT_URL,
+    }
+end
+
+--- Send a sample sentence to the configured server and show the translation
+-- or the exact error.
+function Japanese:testLocalTranslator()
+    local LocalTranslator = require("localtranslator")
+    local opts = {
+        url = G_reader_settings:readSetting("language_japanese_local_tr_url")
+            or LocalTranslator.DEFAULT_URL,
+    }
+    require("ui/trapper"):wrap(function()
+        local Trapper = require("ui/trapper")
+        local completed, ok_flag, payload = Trapper:dismissableRunInSubprocess(function()
+            local tr, err = LocalTranslator.translate(opts, "猫が好きです。")
+            if tr then return true, tr end
+            return false, tostring(err or "no reply")
+        end, _("Testing the local translator…"))
+        if not completed then return end
+        UIManager:show(InfoMessage:new{
+            text = ok_flag and (_("Local translator OK:\n\n猫が好きです。 →\n") .. payload)
+                or (_("Local translation failed:\n\n") .. payload),
+        })
+    end)
+end
+
+function Japanese:genLocalTranslatorMenu()
+    local LocalTranslator_url = function()
+        local ok, LocalTranslator = pcall(require, "localtranslator")
+        return G_reader_settings:readSetting("language_japanese_local_tr_url")
+            or (ok and LocalTranslator.DEFAULT_URL) or ""
+    end
+    return {
+        text = _("Local translation server (offline)"),
+        help_text = _([[
+Translate sentences through a local LLM server instead of Google: llama.cpp's llama-server running LiquidAI's LFM2-350M-ENJP-MT, a small model tuned purely for Japanese→English (much more natural on fiction than classic offline translators).
+
+On the PC, run tools/lfm2-translate-serve.sh (downloads the ~230 MB model on first use) and point the URL at it, e.g. http://192.168.1.10:8087. When enabled, sentence translations try this server first and fall back to Google; with the server on the device itself, translations work fully offline.]]),
+        sub_item_table = {
+            {
+                text = _("Use the local translator"),
+                checked_func = function() return self:isLocalTranslateEnabled() end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:saveSetting("language_japanese_local_translate",
+                        not self:isLocalTranslateEnabled())
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            },
+            {
+                text_func = function()
+                    return T(_("Server: %1"), LocalTranslator_url())
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:promptText(_("Local translation server URL"),
+                        "language_japanese_local_tr_url", touchmenu_instance)
+                end,
+                help_text = _("The llama-server base URL (its OpenAI-compatible /v1/chat/completions endpoint is used)."),
+            },
+            {
+                text = _("Test translation (猫が好きです)"),
+                keep_menu_open = true,
+                callback = function() self:testLocalTranslator() end,
+            },
+        },
+    }
+end
+
+-- ------------------------------------------------ read sentences from here --
+
+--- Register the "Read sentences from here" entry in the text-selection
+-- (highlight) dialog: long-press text, pick it, and the sentence reader
+-- starts at the sentence the selection begins in (enabling the feature if
+-- it was off).
+function Japanese:registerSentenceStartButton()
+    if not (self.ui and self.ui.highlight and self.ui.highlight.addToHighlightDialog) then return end
+    self.ui.highlight:addToHighlightDialog("12_b_read_sentences", function(this)
+        return {
+            text = _("Read sentences from here"),
+            show_in_highlight_dialog_func = function()
+                return self.ui.rolling ~= nil
+                    and this.selected_text ~= nil and this.selected_text.pos0 ~= nil
+                    and util.hasCJKChar(this.selected_text.text or "")
+            end,
+            callback = function()
+                local pos0 = this.selected_text.pos0
+                this:onClose()
+                self:startSentencesAt(pos0)
+            end,
+        }
+    end)
+end
+
+--- Start the sentence reader at the sentence containing xpointer `pos0` (the
+-- start of a text selection). The byte offset within the page text is
+-- computed with the same extraction pageText() uses, so the sentence indices
+-- line up.
+function Japanese:startSentencesAt(pos0)
+    if not self:isSentenceSplittingEnabled() then
+        self:setSentenceSplitting(true)
+    end
+    local ctrl = self:getSentenceSplit()
+    if not (ctrl and self:isSentenceSplittingEnabled()) then return end
+    local ok, byte_pos = pcall(function()
+        local doc = self.ui.document
+        local page = doc:getCurrentPage()
+        local xp0 = doc:getPageXPointer(page)
+        local prefix = doc:getTextFromXPointers(xp0, pos0) or ""
+        return #prefix + 1
+    end)
+    ctrl:startAt(ok and byte_pos or 1)
+end
+
 --- Add an "Analyse (JA)" button to the dictionary lookup popup, so the whole
 -- analysis (dictionary form, type, conjugation, dictionary entry, translation,
 -- AI) is available from a normal lookup too.  Shown only for CJK words.
@@ -939,14 +1103,14 @@ You can also bind “Analyse Japanese word” to a gesture under Gestures.]]),
         end,
     })
 
-    -- Sentence splitting: volume keys read the book sentence by sentence
-    -- (VOICEVOX audio + translation popup + optional furigana).
+    -- Sentence splitting: volume keys step the book sentence by sentence,
+    -- with a marker plus any combination of audio / popup / translation.
     table.insert(sub_item_table, {
         text = _("Sentence splitting (volume keys)"),
         help_text = _([[
-Read the book sentence by sentence with the volume/page-turn keys. Each press speaks the sentence through VOICEVOX (configure the server under Furigana → Word audio), and shows it with its translation in a small popup at the bottom — the audio and translation of the next two sentences are prepared in the background, so stepping forward is smooth.
+Read the book sentence by sentence with the volume/page-turn keys. Each press moves a faint marker onto the sentence's first character and — per the "On each step" toggles — speaks it through VOICEVOX, and/or shows it (with furigana) and its translation in a popup right above the sentence. Audio and translation of the next two sentences are prepared in the background, so stepping forward is smooth.
 
-While enabled, the keys step sentences instead of turning pages (tapping still turns them); the first press starts at the current page's first sentence. Tap the popup to hear the sentence again. Needs the Furigana plugin.]]),
+While enabled, the keys step sentences instead of turning pages (tapping still turns them). Tap the popup to show/hide the translation, double-tap to replay the audio; hold text on the popup to look it up in the dictionary. You can also long-press text on the page and choose 'Read sentences from here'. Needs the Furigana plugin.]]),
         sub_item_table = {
             {
                 text = _("Volume keys read sentences"),
@@ -956,10 +1120,41 @@ While enabled, the keys step sentences instead of turning pages (tapping still t
                     self:setSentenceSplitting(not self:isSentenceSplittingEnabled())
                     if touchmenu_instance then touchmenu_instance:updateItems() end
                 end,
-                help_text = _("Repurpose the volume/page-turn keys: forward = next sentence (audio + translation), back = previous sentence. Turn off to get page turning back. Can also be toggled by binding 'Japanese sentence splitting' to a gesture."),
+                help_text = _("Repurpose the volume/page-turn keys: forward = next sentence, back = previous sentence. Turn off to get page turning back. Can also be toggled by binding 'Japanese sentence splitting' to a gesture."),
+                separator = true,
             },
             {
-                text = _("Show furigana in the sentence popup"),
+                text = _("On each step: play audio (VOICEVOX)"),
+                checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_audio") end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:flipNilOrTrue("language_japanese_sentence_audio")
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _("Speak each sentence when you step onto it (configure the engine under Furigana → Word audio). Off: stepping stays silent — a double tap on the popup still plays the sentence on demand."),
+            },
+            {
+                text = _("On each step: show the popup"),
+                checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_popup") end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:flipNilOrTrue("language_japanese_sentence_popup")
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _("Show the sentence bubble on each step. With this and the audio off, the keys become a pure sentence cursor: only the marker moves, nothing plays or is fetched — for skipping to where you want to resume."),
+            },
+            {
+                text = _("Popup: show the Japanese sentence"),
+                checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_show_jp") end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:flipNilOrTrue("language_japanese_sentence_show_jp")
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _("Show the sentence itself in the popup. Off (with translation on), only the English line appears — the Japanese stays on the page, marked by the cursor."),
+            },
+            {
+                text = _("Popup: furigana on the sentence"),
                 checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_furigana") end,
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
@@ -969,17 +1164,43 @@ While enabled, the keys step sentences instead of turning pages (tapping still t
                 help_text = _("Splice each word's reading into the sentence shown in the popup, e.g. 私（わたし）は行（い）く。 Uses the Furigana plugin's dictionary (the first sentence loads it, which takes a moment)."),
             },
             {
-                text = _("Show translation in the sentence popup"),
+                text = _("Popup: show the translation"),
                 checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_translate") end,
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
                     G_reader_settings:flipNilOrTrue("language_japanese_sentence_translate")
                     if touchmenu_instance then touchmenu_instance:updateItems() end
                 end,
-                help_text = _("Show the sentence's Google translation under it in the popup (it appears as soon as it arrives and is cached). Needs a network connection — the audio does not, so with Wi-Fi off you still get speech, just no translation."),
+                help_text = _("Show the sentence's translation under it in the popup (it appears as soon as it arrives and is cached). Uses the local translation server when configured, Google otherwise (which needs a network connection — the audio does not)."),
+                separator = true,
+            },
+            {
+                text_func = function()
+                    local labels = {
+                        none = _("nothing (step immediately)"),
+                        volume = _("volume up/down"),
+                        toggle = _("stop/start sentence reading"),
+                        replay = _("replay the sentence audio"),
+                        translation = _("show/hide the translation"),
+                        page = _("turn a whole page"),
+                    }
+                    local action = G_reader_settings:readSetting("language_japanese_sentence_doublepress") or "none"
+                    return T(_("Double press: %1"), labels[action] or action)
+                end,
+                help_text = _([[What a quick double press of a stepping key does. The key's direction matters where it can: double volume-up raises the media volume / turns forward, double volume-down lowers it / turns back.
+
+Any choice other than 'nothing' delays single steps slightly (the double-press window).]]),
+                sub_item_table_func = function()
+                    return self:genDoublePressMenu()
+                end,
             },
         },
     })
+
+    -- Offline translation through a local LLM server (llama.cpp +
+    -- LFM2-350M-ENJP-MT); preferred over Google wherever sentences are
+    -- translated when enabled.
+    table.insert(sub_item_table, self:genLocalTranslatorMenu())
 
     -- Order of the analysis pages (AI / Google Translate / dictionaries).
     table.insert(sub_item_table, {
