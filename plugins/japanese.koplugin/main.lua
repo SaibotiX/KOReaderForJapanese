@@ -64,6 +64,15 @@ function Japanese:init()
         self:registerDictButton()
     end
     self:registerSentenceStartButton()
+    self:registerLocalTranslateButton()
+    -- The double-press action used to be one setting for both stepping keys;
+    -- it is per key now. Carry an old choice over to both keys once.
+    local legacy = G_reader_settings:readSetting("language_japanese_sentence_doublepress")
+    if legacy then
+        G_reader_settings:saveSetting("language_japanese_sentence_doublepress_next", legacy)
+        G_reader_settings:saveSetting("language_japanese_sentence_doublepress_prev", legacy)
+        G_reader_settings:delSetting("language_japanese_sentence_doublepress")
+    end
 end
 
 function Japanese:supportsLanguage(language_code)
@@ -722,32 +731,67 @@ function Japanese:onCloseDocument()
     end
 end
 
---- The double-press action picker (radio submenu).
-function Japanese:genDoublePressMenu()
-    local choices = {
+--- The choices a stepping key's double press can be set to, labelled for the
+-- key's direction (dir 1 = the "next sentence" key, -1 = "previous").
+function Japanese:doublePressChoices(dir)
+    local fwd = dir > 0
+    return {
         { id = "none", text = _("Nothing (step immediately, no delay)") },
-        { id = "volume", text = _("Media volume up / down (Android)") },
+        { id = "volume", text = fwd and _("Raise the media volume (Android)")
+            or _("Lower the media volume (Android)") },
         { id = "toggle", text = _("Stop / start sentence reading") },
         { id = "replay", text = _("Replay the sentence audio") },
         { id = "translation", text = _("Show / hide the translation") },
-        { id = "page", text = _("Turn a whole page forward / back") },
+        { id = "furigana", text = _("Show / hide the furigana") },
+        { id = "popup", text = _("Show / hide the popup") },
+        { id = "page", text = fwd and _("Turn a whole page forward")
+            or _("Turn a whole page back") },
     }
+end
+
+--- The double-press action picker for one stepping key (radio submenu).
+function Japanese:genDoublePressMenu(setting_key, dir)
     local items = {}
-    for _, choice in ipairs(choices) do
+    for _, choice in ipairs(self:doublePressChoices(dir)) do
         items[#items + 1] = {
             text = choice.text,
             radio = true,
             checked_func = function()
-                return (G_reader_settings:readSetting("language_japanese_sentence_doublepress") or "none")
-                    == choice.id
+                return (G_reader_settings:readSetting(setting_key) or "none") == choice.id
             end,
             callback = function()
-                G_reader_settings:saveSetting("language_japanese_sentence_doublepress",
+                G_reader_settings:saveSetting(setting_key,
                     choice.id ~= "none" and choice.id or nil)
             end,
         }
     end
     return items
+end
+
+--- One "Double press: …" menu entry for a stepping key.
+function Japanese:genDoublePressItem(dir)
+    local setting_key = dir > 0 and "language_japanese_sentence_doublepress_next"
+        or "language_japanese_sentence_doublepress_prev"
+    local key_label = dir > 0 and _("Double press next key: %1")
+        or _("Double press previous key: %1")
+    return {
+        text_func = function()
+            local action = G_reader_settings:readSetting(setting_key) or "none"
+            local label = action
+            for _, choice in ipairs(self:doublePressChoices(dir)) do
+                if choice.id == action then label = choice.text:lower() end
+            end
+            return T(key_label, label)
+        end,
+        help_text = _([[What a quick double press of this stepping key does — each key has its own action, so e.g. "replay the sentence audio" can sit on one key with the other left plain.
+
+"Show / hide the furigana" flips the readings in the popup; "Show / hide the popup" summons the current sentence's bubble on demand, even when "On each step: show the popup" is off.
+
+Any choice other than 'nothing' delays this key's single steps slightly (the double-press window); a key set to 'nothing' always steps instantly.]]),
+        sub_item_table_func = function()
+            return self:genDoublePressMenu(setting_key, dir)
+        end,
+    }
 end
 
 -- ------------------------------------------------------- local translation --
@@ -863,6 +907,94 @@ function Japanese:registerSentenceStartButton()
             end,
         }
     end)
+end
+
+--- Register the "Translate (local LLM)" entry in the text-selection
+-- (highlight) dialog: long-press/select text, and the selection is
+-- translated through the configured local server — same engine the sentence
+-- reader uses, works offline. Shown only while the local translator is
+-- enabled. The same translation is also available as the long-press action
+-- "Local LLM translation" (see readerhighlight.lua, which dispatches the
+-- TranslateLocalText event handled below).
+function Japanese:registerLocalTranslateButton()
+    if not (self.ui and self.ui.highlight and self.ui.highlight.addToHighlightDialog) then return end
+    self.ui.highlight:addToHighlightDialog("12_c_local_translate", function(this)
+        return {
+            text = _("Translate (local LLM)"),
+            show_in_highlight_dialog_func = function()
+                return self:isLocalTranslateEnabled()
+                    and this.selected_text ~= nil
+                    and (this.selected_text.text or "") ~= ""
+            end,
+            callback = function()
+                local text = this.selected_text.text
+                this:onClose(true) -- keep the selection visible under the result
+                self:onTranslateLocalText(text)
+            end,
+        }
+    end)
+end
+
+--- Translate `text` through the local LLM server and show the result.
+-- Long selections are split into sentences first (the model is tuned for
+-- sentence-level translation) and translated one by one; a single request
+-- otherwise. Runs in a dismissable subprocess, so the UI stays live and a
+-- tap cancels. Returns true when handled — with the local translator
+-- disabled it returns nothing, so the caller (readerhighlight's long-press
+-- action) falls back to the regular translator.
+function Japanese:onTranslateLocalText(text)
+    local opts = self:localTranslatorOpts()
+    if not opts then return end
+    if not text or text == "" then return true end
+    text = util.cleanupSelectedText(text)
+    require("ui/trapper"):wrap(function()
+        local Trapper = require("ui/trapper")
+        local completed, ok_flag, payload = Trapper:dismissableRunInSubprocess(function()
+            local LocalTranslator = require("localtranslator")
+            -- Sentence-split long selections (reusing the sentence reader's
+            -- splitter when the furigana plugin is around); fall back to one
+            -- request with a widened output cap.
+            local sents
+            if #text > 200 then
+                pcall(function()
+                    local AutoReader = require("autoreader")
+                    local list = AutoReader.splitSentences(text)
+                    if type(list) == "table" and #list > 1 then sents = list end
+                end)
+            end
+            if not sents or #sents == 0 then sents = { text } end
+            local out = {}
+            for _, s in ipairs(sents) do
+                local tr, err = LocalTranslator.translate(
+                    { url = opts.url, max_tokens = #sents == 1 and 512 or nil }, s)
+                if not tr then
+                    return false, tostring(err or "no reply")
+                end
+                out[#out + 1] = tr
+            end
+            return true, table.concat(out, " ")
+        end, _("Translating (local LLM)…"))
+        if not completed then return end
+        if ok_flag then
+            self:showLocalTranslation(text, payload)
+        else
+            UIManager:show(InfoMessage:new{
+                text = T(_("Local translation failed: %1"), payload),
+            })
+        end
+    end)
+    return true
+end
+
+--- The local translation result: selection on top, translation underneath,
+-- in a scrollable viewer (selections can be long).
+function Japanese:showLocalTranslation(text, translation)
+    local TextViewer = require("ui/widget/textviewer")
+    UIManager:show(TextViewer:new{
+        title = _("Local translation"),
+        text = text .. "\n\n― ― ―\n\n" .. translation,
+        justified = false,
+    })
 end
 
 --- Start the sentence reader at the sentence containing xpointer `pos0` (the
@@ -1174,26 +1306,8 @@ While enabled, the keys step sentences instead of turning pages (tapping still t
                 help_text = _("Show the sentence's translation under it in the popup (it appears as soon as it arrives and is cached). Uses the local translation server when configured, Google otherwise (which needs a network connection — the audio does not)."),
                 separator = true,
             },
-            {
-                text_func = function()
-                    local labels = {
-                        none = _("nothing (step immediately)"),
-                        volume = _("volume up/down"),
-                        toggle = _("stop/start sentence reading"),
-                        replay = _("replay the sentence audio"),
-                        translation = _("show/hide the translation"),
-                        page = _("turn a whole page"),
-                    }
-                    local action = G_reader_settings:readSetting("language_japanese_sentence_doublepress") or "none"
-                    return T(_("Double press: %1"), labels[action] or action)
-                end,
-                help_text = _([[What a quick double press of a stepping key does. The key's direction matters where it can: double volume-up raises the media volume / turns forward, double volume-down lowers it / turns back.
-
-Any choice other than 'nothing' delays single steps slightly (the double-press window).]]),
-                sub_item_table_func = function()
-                    return self:genDoublePressMenu()
-                end,
-            },
+            self:genDoublePressItem(1),
+            self:genDoublePressItem(-1),
         },
     })
 

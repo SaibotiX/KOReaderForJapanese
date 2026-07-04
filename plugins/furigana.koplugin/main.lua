@@ -184,8 +184,10 @@ function Furigana:isShowingAnnotated()
 end
 
 -- Cache path for the annotated copy of `src`, keyed by path + size + mtime + dict
--- version + furigana level, so it is regenerated if the book, the dictionary, or
--- the selected level changes (each level caches separately).
+-- version + furigana level + annotator output version, so it is regenerated if
+-- the book, the dictionary, the selected level, or the annotator's output format
+-- changes (each level caches separately; the output version also retires copies
+-- that a pre-verification annotator may have left truncated).
 function Furigana:annotatedPathFor(src)
     local attr = lfs.attributes(src)
     local size = attr and attr.size or 0
@@ -194,6 +196,7 @@ function Furigana:annotatedPathFor(src)
     local key = hash_str(src) .. "_" .. size .. "_" .. mtime
         .. "_v" .. dict_version .. "_g" .. self:getMinGrade()
         .. "_r" .. (self:getReplaceRuby() and 1 or 0)
+        .. "_a" .. (EpubAnnotator.OUTPUT_VERSION or 1)
     return self.cache_dir .. "/" .. key .. "." .. annotated_ext(src)
 end
 

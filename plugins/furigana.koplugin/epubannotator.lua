@@ -14,6 +14,13 @@ be unit-tested outside KOReader. `annotate_epub` uses KOReader's ffi/archiver.
 
 local M = {}
 
+-- Bumped whenever the annotated-copy output changes in a way that must
+-- invalidate previously generated copies (main.lua bakes it into the cache
+-- key). 2: verified archive output — a write that failed midway (device out
+-- of space) used to be kept silently, and such a truncated EPUB rendered as
+-- a book cut off at its first picture.
+M.OUTPUT_VERSION = 2
+
 -- Tags whose text content must not be annotated (matches wrapper.py _SKIP_TAGS).
 local SKIP_TAGS = {
     script = true, style = true, head = true,
@@ -201,14 +208,26 @@ function M.annotate_html_file(tokenizer, src, dest, progress_cb, replace_ruby)
 
     local out = io.open(dest, "wb")
     if not out then return false, "could not open destination file" end
-    out:write(data)
-    out:close()
+    local ok_write = out:write(data)
+    local ok_close = out:close()
+    if not ok_write or ok_close == false then
+        os.remove(dest)
+        return false, "could not write the annotated file (storage full?)"
+    end
     return true
 end
 
 -- ------------------------------------------------------------- EPUB rewrite --
 
 local CONTENT_EXTS = { xhtml = true, html = true, htm = true }
+
+-- Entries stored as-is instead of re-deflated: already-compressed media
+-- gains nothing from another deflate pass, and images dominate the bytes of
+-- illustrated books — skipping them saves minutes of device CPU per book.
+local STORE_EXTS = {
+    jpg = true, jpeg = true, png = true, gif = true, webp = true,
+    mp3 = true, m4a = true, mp4 = true, ogg = true, woff = true, woff2 = true,
+}
 
 local function lower_ext(name)
     return (name:match("%.([%a%d]+)$") or ""):lower()
@@ -232,18 +251,22 @@ function M.annotate_epub(tokenizer, src, dest, progress_cb, replace_ruby)
         return false, "could not open source EPUB"
     end
 
-    -- Collect file entries; put mimetype first (required for a valid EPUB).
+    -- Collect file entries; put mimetype first (required for a valid EPUB)
+    -- and keep the archive order otherwise. table.sort is not stable, so the
+    -- order is made explicit via ranks — a comparator that returns false for
+    -- "equal" entries would let quicksort shuffle images and spine documents
+    -- around arbitrarily.
     local files = {}
     for entry in reader:iterate() do
         if entry.mode == "file" then
             files[#files + 1] = entry.path
         end
     end
-    table.sort(files, function(a, b)
-        if a == "mimetype" then return true end
-        if b == "mimetype" then return false end
-        return false -- otherwise keep input order (stable enough for crengine)
-    end)
+    local rank = {}
+    for i, name in ipairs(files) do
+        rank[name] = name == "mimetype" and 0 or i
+    end
+    table.sort(files, function(a, b) return rank[a] < rank[b] end)
 
     local total = 0
     for _, name in ipairs(files) do
@@ -264,20 +287,25 @@ function M.annotate_epub(tokenizer, src, dest, progress_cb, replace_ruby)
             if data == nil then
                 error("could not read entry: " .. name)
             end
-            if name == "mimetype" then
-                writer:setZipCompression("store")
-                writer:addFileFromMemory(name, data, mtime)
-                writer:setZipCompression("deflate")
-            else
-                if CONTENT_EXTS[lower_ext(name)] then
-                    if replace_ruby then data = M.strip_ruby(data) end
-                    data = M.annotate_fragment(tokenizer, data)
-                    done = done + 1
-                    if progress_cb and progress_cb(done, total, name) == false then
-                        error("aborted by user")
-                    end
+            if CONTENT_EXTS[lower_ext(name)] then
+                if replace_ruby then data = M.strip_ruby(data) end
+                data = M.annotate_fragment(tokenizer, data)
+                done = done + 1
+                if progress_cb and progress_cb(done, total, name) == false then
+                    error("aborted by user")
                 end
-                writer:addFileFromMemory(name, data, mtime)
+            end
+            local store = name == "mimetype" or STORE_EXTS[lower_ext(name)]
+            if store then writer:setZipCompression("store") end
+            local written = writer:addFileFromMemory(name, data, mtime)
+            if store then writer:setZipCompression("deflate") end
+            -- A failed write (device out of space, I/O error) must fail the
+            -- whole run: it used to be ignored, and the truncated EPUB that
+            -- resulted was kept — and cached — as if it were good, showing
+            -- up as a book cut off at its first picture.
+            if not written then
+                error("could not write entry: " .. name
+                    .. (writer.err and (" (" .. tostring(writer.err) .. ")") or ""))
             end
         end
     end)
@@ -288,6 +316,26 @@ function M.annotate_epub(tokenizer, src, dest, progress_cb, replace_ruby)
     if not ok then
         os.remove(dest)
         return false, tostring(err)
+    end
+
+    -- Writer:close() flushes the archive's central directory without
+    -- reporting errors, so prove the output is a complete, readable archive
+    -- before anyone gets to open it: every source entry must be enumerable
+    -- again. Cheap (headers only), and it turns any silent truncation left
+    -- by the environment into a clean failure instead of a broken book.
+    local check = Archiver.Reader:new()
+    local readable = 0
+    if check:open(dest) then
+        for entry in check:iterate() do
+            if entry.mode == "file" then readable = readable + 1 end
+        end
+        check:close()
+    end
+    if readable < #files then
+        os.remove(dest)
+        return false, string.format(
+            "output verification failed (%d of %d entries readable — storage full?)",
+            readable, #files)
     end
     return true
 end

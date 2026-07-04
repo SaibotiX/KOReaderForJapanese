@@ -13,16 +13,20 @@
 -- otherwise; swapped in as soon as it arrives). Text on the popup can be
 -- hold-selected for a dictionary lookup. Stepping past either end of the
 -- page turns it; a sentence that runs across a page boundary is completed
--- with the next page's beginning, exactly like the auto reader. A configured
--- double press of a stepping key adjusts the media volume, stops/starts the
--- feature, replays, toggles the translation, or turns a whole page; and the
+-- with the next page's beginning, exactly like the auto reader. A double
+-- press of a stepping key runs that key's own configured action (media
+-- volume, stop/start, replay, translation, furigana, popup on demand, or a
+-- whole page turn — the two keys are configured independently); and the
 -- highlight dialog's "Read sentences from here" starts at any sentence
 -- (Controller:startAt).
 --
--- Smoothness comes from working ahead: a single background subprocess keeps
--- the audio AND the translation of the next two sentences cached (WAVs in the
--- auto reader's sentence cache — the two features share files; translations
--- as small text files), so stepping forward is instant. The page-window word
+-- Smoothness comes from working ahead: two independent background
+-- subprocesses (one per server — VOICEVOX audio, local-LLM/Google
+-- translation) keep the current sentence plus the next two cached (WAVs in
+-- the auto reader's sentence cache — the two features share files;
+-- translations as small text files), so stepping forward is instant. Both
+-- lanes always serve the sentence the reader is on: work for a sentence that
+-- was stepped past is killed, never queued through. The page-window word
 -- precache is paused (fg.lock) while we hold the engine.
 --
 -- The heavy lifting is reused from the furigana plugin (sentence splitter,
@@ -45,11 +49,14 @@ SentenceSplitting.MAX_TRIES = 2          -- per WAV / per translation, then give
 SentenceSplitting.MAX_PAGE_SEEK = 5      -- pages scanned for text before giving up
 SentenceSplitting.KEEP_TRANSLATIONS = 400 -- cached translation files kept on stop()
 -- Whole sentences are bigger than the auto reader's clause chunks, so the
--- background fetch gets roomier per-request timeouts and a longer hung-fetch
--- deadline; the user is never blocked on it (the popup shows immediately).
+-- background fetches get roomier per-request timeouts and longer hung-fetch
+-- deadlines; the user is never blocked on them (the popup shows immediately).
+-- The translation lane's deadline covers a slow local-LLM generation plus
+-- the Google fallback after it.
 SentenceSplitting.SYNTH_BLOCK_TIMEOUT = 45
 SentenceSplitting.SYNTH_TOTAL_TIMEOUT = 120
 SentenceSplitting.FETCH_DEADLINE_S = 150
+SentenceSplitting.TR_FETCH_DEADLINE_S = 180
 -- A second tap on the popup within this window means "double tap" (replay);
 -- a lone tap toggles the translation once the window has passed. Detected
 -- here rather than through GestureDetector's double_tap, which is usually
@@ -82,11 +89,11 @@ function SentenceSplitting.buildPage(text, next_text, skip)
     if skip and skip > 0 then
         raw = raw:sub(skip + 1)
     end
-    local sents, last_incomplete = AutoReader.splitSentences(raw)
+    local sents, last_incomplete, open_depth = AutoReader.splitSentences(raw)
     local consumed = 0
     local carry_len = 0
     if last_incomplete and #sents > 0 and next_text and next_text ~= "" then
-        local head, c = AutoReader.sentenceHead(next_text, AutoReader.HEAD_MAX_BYTES)
+        local head, c = AutoReader.sentenceHead(next_text, AutoReader.HEAD_MAX_BYTES, open_depth)
         if head then
             if head ~= "" then
                 sents[#sents] = sents[#sents] .. head
@@ -103,9 +110,9 @@ end
 -- page be entered from either direction with the same sentence boundaries.
 function SentenceSplitting.computeSkip(prev_text, text)
     if not prev_text or prev_text == "" or not text or text == "" then return 0 end
-    local sents, last_incomplete = AutoReader.splitSentences(prev_text)
+    local sents, last_incomplete, open_depth = AutoReader.splitSentences(prev_text)
     if last_incomplete and #sents > 0 then
-        local head, consumed = AutoReader.sentenceHead(text, AutoReader.HEAD_MAX_BYTES)
+        local head, consumed = AutoReader.sentenceHead(text, AutoReader.HEAD_MAX_BYTES, open_depth)
         if head then return consumed end
     end
     return 0
@@ -229,7 +236,8 @@ function SentenceSplitting.newController(plugin)
         plugin = plugin,   -- the japanese.koplugin instance (for ui + tokenizer)
         session = nil,     -- { page, sents, idx, display, next_sents }
         token = 0,         -- bumped on every step/reset; stale results are dropped
-        fetch = nil,       -- single in-flight subprocess { pid, started, wav_text, wav_out }
+        fetch_wav = nil,   -- in-flight audio subprocess { pid, started, text, out }
+        fetch_tr = nil,    -- in-flight translation subprocess (same shape)
         wav_tries = {},    -- text -> attempts (given up after MAX_TRIES)
         tr_tries = {},
         key_seqs = nil,    -- { { seq, dir } } captured from the deactivated bindings
@@ -304,9 +312,16 @@ function Controller:translateEnabled()
     return G_reader_settings:nilOrTrue("language_japanese_sentence_translate")
 end
 
---- The configured double-press action ("none" = plain stepping, no delay).
-function Controller:doublePressAction()
-    return G_reader_settings:readSetting("language_japanese_sentence_doublepress") or "none"
+--- The configured double-press action for one stepping key ("none" = plain
+-- stepping, no delay for that key). Each key (next / previous) has its own
+-- action, so e.g. "replay" can sit on volume-up with volume-down left plain.
+-- The pre-split single setting is honored as a fallback for both keys.
+function Controller:doublePressAction(dir)
+    local key = dir > 0 and "language_japanese_sentence_doublepress_next"
+        or "language_japanese_sentence_doublepress_prev"
+    return G_reader_settings:readSetting(key)
+        or G_reader_settings:readSetting("language_japanese_sentence_doublepress")
+        or "none"
 end
 
 --- The local LLM translator's opts (nil when disabled): translations then try
@@ -485,15 +500,13 @@ function Controller:buildAt(page)
 end
 
 --- Every stepping key press funnels through here (the reader-level KeyPress
--- and the popup's own bindings). With a double-press action configured, the
--- first press is held back for DOUBLE_PRESS_S: a second press of the same key
--- within the window fires the action instead of two steps; a press of the
--- other key flushes the held step first. With "none" (the default) presses
--- step immediately.
+-- and the popup's own bindings). With a double-press action configured on a
+-- key, its first press is held back for DOUBLE_PRESS_S: a second press of the
+-- same key within the window fires that key's action instead of two steps; a
+-- press of the other key flushes the held step first. A key whose action is
+-- "none" (the default) steps immediately, without any delay — the two keys
+-- are fully independent.
 function Controller:onStep(dir)
-    if self:doublePressAction() == "none" then
-        return self:stepNow(dir)
-    end
     local UIManager = require("ui/uimanager")
     if self._pending_step_dir == dir then
         UIManager:unschedule(self._pending_step_fn)
@@ -506,6 +519,9 @@ function Controller:onStep(dir)
         local held = self._pending_step_dir
         self._pending_step_dir = nil
         self:stepNow(held)
+    end
+    if self:doublePressAction(dir) == "none" then
+        return self:stepNow(dir)
     end
     self._pending_step_dir = dir
     self._pending_step_fn = self._pending_step_fn or function()
@@ -566,10 +582,11 @@ function Controller:stepNow(dir)
     return true
 end
 
---- A double press of a stepping key. dir is the key's direction, so actions
--- can be direction-aware (volume up/down, page forward/back).
+--- A double press of a stepping key runs that key's own configured action.
+-- dir is the key's direction, so direction-aware actions do the natural
+-- thing (volume up/down, page forward/back).
 function Controller:onDoublePress(dir)
-    local action = self:doublePressAction()
+    local action = self:doublePressAction(dir)
     if action == "volume" then
         self:adjustVolume(dir)
     elseif action == "toggle" then
@@ -582,6 +599,10 @@ function Controller:onDoublePress(dir)
         self:replay()
     elseif action == "translation" then
         self:toggleTranslation()
+    elseif action == "furigana" then
+        self:toggleFurigana()
+    elseif action == "popup" then
+        self:togglePopupNow()
     elseif action == "page" then
         -- Jump a whole page without stepping through its sentences; the next
         -- single press starts at the new page's first sentence.
@@ -589,6 +610,61 @@ function Controller:onDoublePress(dir)
         self:flip(dir)
     end
     return true
+end
+
+--- Double-press "furigana": flip the popup's furigana splicing and rebuild
+-- the current display so the change shows immediately (on the popup when one
+-- is up; otherwise the new choice simply applies from the next popup on).
+function Controller:toggleFurigana()
+    G_reader_settings:flipNilOrTrue("language_japanese_sentence_furigana")
+    local s = self.session
+    if not (s and s.idx > 0) then
+        local _ = require("gettext")
+        self:notify(self:furiganaEnabled() and _("Popup furigana on.")
+            or _("Popup furigana off."), 2)
+        return
+    end
+    local text = s.sents[s.idx]
+    s.display = self:showJpEnabled()
+        and (self:furiganaEnabled() and self:annotate(text) or text) or nil
+    if self.popup then
+        local tr = self:translateEnabled() and self.tr_visible
+            and self:cachedTranslation(text) or nil
+        self:showPopup(s.display, tr)
+    end
+end
+
+--- Double-press "popup": summon the current sentence's bubble on demand —
+-- even with the per-step popup switched off (pure-cursor reading with an
+-- occasional peek) — or dismiss the one showing. Starts the session at the
+-- page's first sentence when nothing is selected yet.
+function Controller:togglePopupNow()
+    local UIManager = require("ui/uimanager")
+    if self.popup then
+        UIManager:close(self.popup)
+        self.popup = nil
+        return
+    end
+    local s = self.session
+    if not (s and s.idx > 0) then
+        self:stepNow(1)
+        s = self.session
+        if not (s and s.idx > 0) or self.popup then
+            return -- nothing to show, or the step already brought the popup up
+        end
+    end
+    local text = s.sents[s.idx]
+    if s.display == nil and self:showJpEnabled() then
+        s.display = self:furiganaEnabled() and self:annotate(text) or text
+    end
+    local tr
+    if self:translateEnabled() and self.tr_visible then
+        tr = self:cachedTranslation(text)
+    end
+    self:showPopup(s.display, tr)
+    if self:translateEnabled() and self.tr_visible and not tr then
+        self:kickFetch() -- a shown popup makes its translation wanted
+    end
 end
 
 --- Raise/lower the real media volume (double-press "volume" action):
@@ -804,7 +880,10 @@ function Controller:clearMarker()
 end
 
 -- Repaint the spots the marker left and entered (crengine draws into the
--- page, so the reader view must redraw those regions).
+-- page, so the reader view must redraw those regions). The ReaderUI window
+-- itself must be marked dirty: setDirty(nil, …) only enqueues an e-ink
+-- refresh of the stale framebuffer, so with popup and audio off (nothing
+-- else repainting the stack) the marker never became visible.
 function Controller:repaintMarker(a, b)
     local x0, y0, x1, y1
     for _, r in ipairs({ a, b }) do
@@ -823,7 +902,8 @@ function Controller:repaintMarker(a, b)
     local Geom = require("ui/geometry")
     local region = Geom:new{ x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
     local UIManager = require("ui/uimanager")
-    UIManager:setDirty(nil, function()
+    local readerui = self.plugin.ui and (self.plugin.ui.dialog or self.plugin.ui)
+    UIManager:setDirty(readerui or "all", function()
         return "ui", region
     end)
 end
@@ -1036,78 +1116,97 @@ function Controller:lookaheadTexts()
     return out
 end
 
---- What is still missing: at most one WAV per job (the engine synthesizes
--- serially anyway; the current sentence always wins) and every missing
--- translation. nil when the window is fully cached.
-function Controller:wants()
+--- The most useful missing item per lane, current sentence first: one WAV
+-- for the audio lane and one translation for the translation lane. nil when
+-- that lane's window is fully cached (or the feature is off).
+function Controller:wantedItems()
     local s = self.session
-    if not (s and s.idx > 0) then return nil end
+    if not (s and s.idx > 0) then return nil, nil end
     local lfs = require("libs/libkoreader-lfs")
     local opts = self:voicevoxOpts()
-    -- Translations only matter while the popup shows them, and are only worth
-    -- attempting online (the tries would just be burned) — unless the local
-    -- translator is on: 127.0.0.1 doesn't need a network. Once the network is
-    -- back, the next step resumes fetching.
-    local want_tr = self:translateEnabled() and self:popupEnabled()
+    -- Translations only matter while a popup can show them (the per-step
+    -- popup, or one summoned on demand), and are only worth attempting online
+    -- (the tries would just be burned) — unless the local translator is on:
+    -- 127.0.0.1 doesn't need a network. Once the network is back, the next
+    -- step resumes fetching.
+    local want_tr = self:translateEnabled()
+        and (self:popupEnabled() or self.popup ~= nil)
         and (self:isOnline() or self:localTranslatorOpts() ~= nil)
     -- Audio is prefetched only while the audio step-action is on; an explicit
     -- replay request (_await_play) is honored regardless.
     local want_audio = opts.url ~= "" and (self:audioEnabled() or self._await_play ~= nil)
-    local w = { translations = {} }
-    for i, text in ipairs(self:lookaheadTexts()) do
-        if want_audio and not w.wav
+    local wav_item, tr_item
+    for _, text in ipairs(self:lookaheadTexts()) do
+        if want_audio and not wav_item
                 and (self:audioEnabled() or text == self._await_play)
                 and (self.wav_tries[text] or 0) < SentenceSplitting.MAX_TRIES then
             local wav, exists = self:wavFor(text)
             if not exists then
-                w.wav = { text = text, out = wav, current = (i == 1) }
+                wav_item = { text = text, out = wav }
             end
         end
-        if want_tr and (self.tr_tries[text] or 0) < SentenceSplitting.MAX_TRIES
+        if want_tr and not tr_item
+                and (self.tr_tries[text] or 0) < SentenceSplitting.MAX_TRIES
                 and lfs.attributes(self:trPath(text), "mode") ~= "file" then
-            w.translations[#w.translations + 1] = { text = text, out = self:trPath(text) }
+            tr_item = { text = text, out = self:trPath(text) }
         end
+        if wav_item and tr_item then break end
     end
-    if not w.wav and #w.translations == 0 then return nil end
-    return w
+    return wav_item, tr_item
 end
 
---- Keep exactly one fetch subprocess busy with the most useful job. A stale
--- background fetch is killed when the user is now waiting for a different
--- sentence's audio.
+--- Bring one fetch lane in line with its wanted item. An in-flight fetch for
+-- anything else — a sentence that was stepped past before it finished — is
+-- killed on the spot (its try is refunded: it did not fail, it was
+-- abandoned), so each lane always works for the sentence the reader is
+-- actually on, never through a backlog of skipped ones. Returns true when a
+-- new fetch for `item` should be started.
+function Controller:syncLane(lane, item, tries)
+    local cur = self[lane]
+    if cur then
+        if item and item.text == cur.text then
+            return false -- already fetching exactly this
+        end
+        local ffiutil = require("ffi/util")
+        ffiutil.terminateSubProcess(cur.pid)
+        self._zombies[#self._zombies + 1] = cur.pid
+        tries[cur.text] = math.max(0, (tries[cur.text] or 1) - 1)
+        self[lane] = nil
+    end
+    return item ~= nil
+end
+
+--- Keep both lanes busy with the most useful jobs. Audio (VOICEVOX) and
+-- translation (local LLM / Google) talk to different servers, so they run as
+-- two independent subprocesses and never queue behind each other — the
+-- popup's translation does not wait for a synthesis and vice versa. Stepping
+-- to a new sentence preempts stale work in either lane at once.
 function Controller:kickFetch()
     local UIManager = require("ui/uimanager")
+    local wav_item, tr_item = self:wantedItems()
+    if self:syncLane("fetch_wav", wav_item, self.wav_tries) then
+        self:startWavFetch(wav_item)
+    end
+    if self:syncLane("fetch_tr", tr_item, self.tr_tries) then
+        self:startTrFetch(tr_item)
+    end
+    local busy = self.fetch_wav ~= nil or self.fetch_tr ~= nil
+    self:setEnginePause(busy)
+    if busy then
+        UIManager:unschedule(self._poll_fn)
+        UIManager:scheduleIn(SentenceSplitting.POLL_S, self._poll_fn)
+    end
+end
+
+--- One WAV in a killable subprocess (lands atomically: tmp + rename).
+function Controller:startWavFetch(item)
     local ffiutil = require("ffi/util")
-    local w = self:wants()
-    if not w then
-        if not self.fetch then self:setEnginePause(false) end
-        return
-    end
-    if self.fetch then
-        if w.wav and w.wav.current and self.fetch.wav_text ~= w.wav.text then
-            ffiutil.terminateSubProcess(self.fetch.pid)
-            self._zombies[#self._zombies + 1] = self.fetch.pid
-            self.fetch = nil
-        else
-            return -- busy; its completion re-enters here
-        end
-    end
-
-    self:ensureDir(self:trDir())
-    if w.wav then
-        self:ensureDir(self:wavDir())
-        self.wav_tries[w.wav.text] = (self.wav_tries[w.wav.text] or 0) + 1
-    end
-    for _, t in ipairs(w.translations) do
-        self.tr_tries[t.text] = (self.tr_tries[t.text] or 0) + 1
-    end
-
+    self:ensureDir(self:wavDir())
+    self.wav_tries[item.text] = (self.wav_tries[item.text] or 0) + 1
     local vv = self:voicevoxOpts()
     local job = {
-        wav = w.wav,
-        translations = w.translations,
-        lang = self:targetLang(),
-        local_tr = self:localTranslatorOpts(), -- nil: Google only
+        text = item.text,
+        out = item.out,
         opts = {
             url = vv.url,
             speaker = vv.speaker,
@@ -1117,56 +1216,66 @@ function Controller:kickFetch()
         },
     }
     local pid = ffiutil.runInSubProcess(function(child_pid)
-        -- Translations first (small, fast), then the one WAV; each lands
-        -- atomically (tmp + rename), so a kill can't leave partial files.
-        for _, t in ipairs(job.translations) do
-            local tr
-            if job.local_tr then
-                -- The local LLM first (offline-capable, better literary
-                -- register); Google only as the fallback.
-                local ok, res = pcall(function()
-                    local LocalTranslator = require("localtranslator")
-                    return LocalTranslator.translate(job.local_tr, t.text)
-                end)
-                if ok and type(res) == "string" and res ~= "" then tr = res end
-            end
-            if not tr then
-                local ok, res = pcall(function()
-                    local Translator = require("ui/translator")
-                    return Translator:translate(t.text, job.lang, "ja")
-                end)
-                if ok and type(res) == "string" and res ~= "" then tr = res end
-            end
-            if tr and tr ~= t.text then
-                local tmp = t.out .. ".tmp" .. tostring(child_pid)
-                local fh = io.open(tmp, "w")
-                if fh then
-                    fh:write(tr)
-                    fh:close()
-                    os.rename(tmp, t.out)
-                end
-            end
+        local VoiceVox = require("voicevox")
+        local tmp = job.out .. ".tmp" .. tostring(child_pid)
+        if VoiceVox.fetch(job.opts, job.text, tmp) then
+            os.rename(tmp, job.out)
+        else
+            os.remove(tmp)
         end
-        if job.wav then
-            local VoiceVox = require("voicevox")
-            local tmp = job.wav.out .. ".tmp" .. tostring(child_pid)
-            if VoiceVox.fetch(job.opts, job.wav.text, tmp) then
-                os.rename(tmp, job.wav.out)
-            else
-                os.remove(tmp)
+    end)
+    if pid then
+        self.fetch_wav = { pid = pid, started = os.time(), text = item.text, out = item.out }
+    end
+end
+
+--- One translation in a killable subprocess. Killing it mid-request is what
+-- makes preemption effective with the local LLM too: the dropped connection
+-- makes llama-server abandon the stale generation (the client streams, so
+-- the server notices within a token), freeing it for the current sentence.
+function Controller:startTrFetch(item)
+    local ffiutil = require("ffi/util")
+    self:ensureDir(self:trDir())
+    self.tr_tries[item.text] = (self.tr_tries[item.text] or 0) + 1
+    local job = {
+        text = item.text,
+        out = item.out,
+        lang = self:targetLang(),
+        local_tr = self:localTranslatorOpts(), -- nil: Google only
+    }
+    local pid = ffiutil.runInSubProcess(function(child_pid)
+        local tr
+        if job.local_tr then
+            -- The local LLM first (offline-capable, better literary
+            -- register); Google only as the fallback.
+            local ok, res = pcall(function()
+                local LocalTranslator = require("localtranslator")
+                return LocalTranslator.translate(job.local_tr, job.text)
+            end)
+            if ok and type(res) == "string" and res ~= "" then tr = res end
+        end
+        if not tr then
+            local ok, res = pcall(function()
+                local Translator = require("ui/translator")
+                return Translator:translate(job.text, job.lang, "ja")
+            end)
+            if ok and type(res) == "string" and res ~= "" then tr = res end
+        end
+        if tr and tr ~= job.text then
+            -- Lands atomically (tmp + rename), so a kill can't leave partial
+            -- files.
+            local tmp = job.out .. ".tmp" .. tostring(child_pid)
+            local fh = io.open(tmp, "w")
+            if fh then
+                fh:write(tr)
+                fh:close()
+                os.rename(tmp, job.out)
             end
         end
     end)
-    if not pid then return end
-    self.fetch = {
-        pid = pid,
-        started = os.time(),
-        wav_text = w.wav and w.wav.text,
-        wav_out = w.wav and w.wav.out,
-    }
-    self:setEnginePause(true)
-    UIManager:unschedule(self._poll_fn)
-    UIManager:scheduleIn(SentenceSplitting.POLL_S, self._poll_fn)
+    if pid then
+        self.fetch_tr = { pid = pid, started = os.time(), text = item.text, out = item.out }
+    end
 end
 
 --- Hold the furigana plugin's page-window precache worker off the engine
@@ -1195,7 +1304,7 @@ function Controller:pollFetch()
     local ffiutil = require("ffi/util")
     local lfs = require("libs/libkoreader-lfs")
     self:reapZombies()
-    if not self.fetch then
+    if not (self.fetch_wav or self.fetch_tr) then
         if #self._zombies > 0 then
             UIManager:scheduleIn(2, self._poll_fn)
         end
@@ -1203,32 +1312,46 @@ function Controller:pollFetch()
     end
     self:setEnginePause(true)
 
-    if not ffiutil.isSubProcessDone(self.fetch.pid) then
-        if os.time() - (self.fetch.started or 0) < SentenceSplitting.FETCH_DEADLINE_S then
-            UIManager:scheduleIn(SentenceSplitting.POLL_S, self._poll_fn)
-            return
+    -- Collect whichever lanes finished (killing a lane that overran its
+    -- deadline — a hung server can't freeze the session; the tries cap stops
+    -- us from hammering a dead one forever).
+    local finished_wav, finished_tr
+    for lane, deadline in pairs({
+        fetch_wav = SentenceSplitting.FETCH_DEADLINE_S,
+        fetch_tr = SentenceSplitting.TR_FETCH_DEADLINE_S,
+    }) do
+        local f = self[lane]
+        if f then
+            local done = ffiutil.isSubProcessDone(f.pid)
+            if not done and os.time() - (f.started or 0) >= deadline then
+                ffiutil.terminateSubProcess(f.pid)
+                self._zombies[#self._zombies + 1] = f.pid
+                done = true
+            end
+            if done then
+                self[lane] = nil
+                if lane == "fetch_wav" then finished_wav = f else finished_tr = f end
+            end
         end
-        -- Hung synthesis (engine gone?): kill it; the tries cap stops us from
-        -- hammering a dead server forever.
-        ffiutil.terminateSubProcess(self.fetch.pid)
-        self._zombies[#self._zombies + 1] = self.fetch.pid
+    end
+    if not (finished_wav or finished_tr) then
+        UIManager:scheduleIn(SentenceSplitting.POLL_S, self._poll_fn)
+        return
     end
 
-    local fetch = self.fetch
-    self.fetch = nil
     local s = self.session
     if s and s.idx > 0 then
         local cur = s.sents[s.idx]
         -- The audio the user is actually waiting for: play it the moment it
         -- lands (or tell them once when it definitively failed).
-        if self._await_play and fetch.wav_text == self._await_play then
-            if fetch.wav_out and lfs.attributes(fetch.wav_out, "mode") == "file" then
+        if finished_wav and self._await_play and finished_wav.text == self._await_play then
+            if lfs.attributes(finished_wav.out, "mode") == "file" then
                 if self._await_play == cur then
-                    self:play(fetch.wav_out)
+                    self:play(finished_wav.out)
                 else
                     self._await_play = nil
                 end
-            elseif (self.wav_tries[fetch.wav_text] or 0) >= SentenceSplitting.MAX_TRIES then
+            elseif (self.wav_tries[finished_wav.text] or 0) >= SentenceSplitting.MAX_TRIES then
                 self._await_play = nil
                 self:notify(require("gettext")("VOICEVOX could not synthesize this sentence."), 2)
             end
@@ -1248,6 +1371,9 @@ function Controller:pollFetch()
         end
     end
     self:kickFetch()
+    if not (self.fetch_wav or self.fetch_tr) and #self._zombies > 0 then
+        UIManager:scheduleIn(2, self._poll_fn)
+    end
 end
 
 -- ------------------------------------------------------------ reset / stop --
@@ -1263,11 +1389,14 @@ function Controller:reset()
     self:cancelPendingStep()
     self:clearMarker()
     self.session = nil
-    if self.fetch then
-        ffiutil.terminateSubProcess(self.fetch.pid)
-        self._zombies[#self._zombies + 1] = self.fetch.pid
-        self.fetch = nil
-        UIManager:scheduleIn(2, self._poll_fn)
+    for _, lane in ipairs({ "fetch_wav", "fetch_tr" }) do
+        local f = self[lane]
+        if f then
+            ffiutil.terminateSubProcess(f.pid)
+            self._zombies[#self._zombies + 1] = f.pid
+            self[lane] = nil
+            UIManager:scheduleIn(2, self._poll_fn)
+        end
     end
     if self.popup then
         UIManager:close(self.popup)

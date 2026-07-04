@@ -403,6 +403,7 @@ local long_press_action = {
     {_("Select and highlight"), "select"},
     {_("Add note"), "note"},
     {_("Translate"), "translate"},
+    {_("Local LLM translation"), "translate_local"},
     {_("Wikipedia"), "wikipedia"},
     {_("Dictionary"), "dictionary"},
     {_("Fulltext search"), "search"},
@@ -2087,6 +2088,27 @@ function ReaderHighlight:onTranslateText(text, index)
     Translator:showTranslation(text, true, nil, nil, true, index)
 end
 
+--- Long-press action "Local LLM translation": translate the selection
+-- through japanese.koplugin's local translation server (offline-capable).
+-- The plugin consumes the TranslateLocalText event; when it is unavailable
+-- or its local translator is disabled, the regular translator takes over so
+-- the action never dead-ends.
+function ReaderHighlight:translateLocal(index)
+    if self.ui.rolling then
+        -- Extend the selected text to include any punctuation at start or
+        -- end, which may give a better translation with the added context.
+        local extended_text = self.ui.document:extendXPointersToSentenceSegment(self.selected_text.pos0, self.selected_text.pos1)
+        if extended_text then
+            self.selected_text = extended_text
+        end
+    end
+    if #self.selected_text.text > 0 then
+        if not self.ui:handleEvent(Event:new("TranslateLocalText", self.selected_text.text)) then
+            self:onTranslateText(self.selected_text.text, index)
+        end
+    end
+end
+
 function ReaderHighlight:onTranslateCurrentPage()
     local x0, y0, x1, y1, page, is_reflow
     if self.ui.rolling then
@@ -2167,6 +2189,8 @@ function ReaderHighlight:onHoldRelease()
                 self:onClose()
             elseif default_highlight_action == "translate" then
                 self:translate()
+            elseif default_highlight_action == "translate_local" then
+                self:translateLocal()
             elseif default_highlight_action == "wikipedia" then
                 self:lookupWikipedia()
                 self:onClose()

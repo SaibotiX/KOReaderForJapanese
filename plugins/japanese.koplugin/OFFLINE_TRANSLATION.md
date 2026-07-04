@@ -47,6 +47,26 @@ default URL works out of the box with the app installed. Desktop smoke test
 0.4–0.8 s/sentence; expect a handful of seconds per sentence on e-reader
 CPUs — hidden by the sentence reader's 2-ahead background prefetch.
 
+## Performance notes (on-device)
+
+Three things keep a sentence from taking minutes on e-reader CPUs:
+
+- **Thread pinning (server).** The service passes `-t <number of big cores>`
+  (detected from `cpuinfo_max_freq`). llama.cpp splits every matmul evenly
+  across its threads and syncs per op, so on big.LITTLE SoCs the default
+  (all cores) makes every token wait for the slowest A53 — 4 big threads
+  beat 8 mixed ones.
+- **Streaming (client).** `localtranslator.lua` requests SSE. The block
+  timeout then only covers first-token latency and token gaps instead of
+  the whole silent generation (a >30 s sentence used to die in a timeout
+  and burn a retry), and a killed client connection makes llama-server
+  cancel the generation within a token.
+- **Preemption (sentence reader).** Audio and translation run in two
+  independent single-item fetch lanes; stepping to a new sentence kills
+  stale in-flight work instead of queueing behind it. The current
+  sentence's translation is always the very next request the server sees —
+  skipped sentences are abandoned, exactly like VOICEVOX audio.
+
 If LFM2's prose quality disappoints on real novels, the drop-in fallback is a
 Bergamot companion server with Mozilla's `jaen` base model (60 MB, MPL-2.0,
 proven on Android) — same HTTP-behind-localhost shape, different engine.

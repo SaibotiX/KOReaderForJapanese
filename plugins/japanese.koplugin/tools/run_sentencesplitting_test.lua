@@ -30,6 +30,13 @@ G_reader_settings = { -- luacheck: ignore
     delSetting = function(_, k) settings[k] = nil end,
     isTrue = function(_, k) return settings[k] == true end,
     nilOrTrue = function(_, k) return settings[k] ~= false end,
+    flipNilOrTrue = function(self, k)
+        if self:nilOrTrue(k) then
+            settings[k] = false
+        else
+            settings[k] = nil
+        end
+    end,
 }
 
 local queue = {}
@@ -189,6 +196,16 @@ check(SS.computeSkip("完結した文。", page2) == 0,
 local sents2 = SS.buildPage(page2, page3, SS.computeSkip(page1, page2))
 check(#sents2 == 2 and sents2[1] == "次の文。" and sents2[2] == "そして三つ目。",
     "carried bytes are not spoken again on the next page")
+
+-- Quotes across the page break: the 。 inside the still-open 「…」 on the
+-- next page must not end the carried completion early.
+local q1 = "彼は「もう帰る。"
+local q2 = "また明日。」と言った。残りの文。"
+local q_sents = SS.buildPage(q1, q2, 0)
+check(#q_sents == 1 and q_sents[1] == "彼は「もう帰る。また明日。」と言った。",
+    "a quote spanning the page break is completed through its 」: " .. tostring(q_sents[1]))
+check(SS.computeSkip(q1, q2) == #"また明日。」と言った。",
+    "computeSkip carries the quote depth into the next page's head")
 
 -- ---------------------------------------------------------- rubyDisplay --
 
@@ -658,6 +675,7 @@ settings.language_japanese_sentence_popup = nil
 
 -- ========================== double press ==================================
 
+-- The pre-split single setting still works as a fallback for both keys.
 settings.language_japanese_sentence_doublepress = "toggle"
 local toggles = 0
 plugin.onToggleSentenceSplitting = function() toggles = toggles + 1 end
@@ -685,8 +703,84 @@ check(#popups == pops_b4 + 1,
 pump(500)
 check(#popups == pops_b4 + 2,
     "…and then steps itself when its own window passes")
+ctrl:onKeyPress(fake_key("LPgBack"))
+ctrl:onKeyPress(fake_key("LPgBack"))
+check(toggles == 2, "the legacy single setting applies to both keys")
+pump(500)
 settings.language_japanese_sentence_doublepress = nil
 plugin.onToggleSentenceSplitting = nil
+
+-- Per-key actions: each key has its own, and a key set to "none" steps
+-- with no delay even while the other key has an action.
+settings.language_japanese_sentence_doublepress_next = "replay"
+pages[3] = "個別キーの文。次の文。"
+current_page = 3
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500) -- held (next key has an action), steps after the window
+check(popups[#popups].text:find("個別キーの文。", 1, true) ~= nil,
+    "per-key: the action key steps after its window")
+pops_b4 = #popups
+played_before = #played
+ctrl:onKeyPress(fake_key("LPgFwd"))
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(#played == played_before + 1 and #popups == pops_b4,
+    "per-key: double press on the next key replays instead of stepping")
+pops_b4 = #popups
+ctrl:onKeyPress(fake_key("LPgBack")) -- prev key has no action
+check(#popups == pops_b4 + 1,
+    "per-key: the plain key steps immediately (no double-press window)")
+pump(500)
+settings.language_japanese_sentence_doublepress_next = nil
+
+-- "furigana" action: flips the popup's readings in place.
+settings.language_japanese_sentence_doublepress_prev = "furigana"
+pages[1] = page1
+current_page = 1
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd")) -- next key plain: steps instantly
+check(popups[#popups].text:find("晴（は）れ", 1, true) ~= nil,
+    "furigana action: the sentence starts with readings on")
+ctrl:onKeyPress(fake_key("LPgBack"))
+ctrl:onKeyPress(fake_key("LPgBack"))
+pump(500)
+check(settings.language_japanese_sentence_furigana == false
+        and popups[#popups].text:find("晴（は）れ", 1, true) == nil
+        and popups[#popups].text:find("今日は晴れ。", 1, true) ~= nil,
+    "double press flips the furigana off and refreshes the shown popup")
+ctrl:onKeyPress(fake_key("LPgBack"))
+ctrl:onKeyPress(fake_key("LPgBack"))
+pump(500)
+check(settings.language_japanese_sentence_furigana == nil
+        and popups[#popups].text:find("晴（は）れ", 1, true) ~= nil,
+    "a further double press brings the readings back")
+settings.language_japanese_sentence_doublepress_prev = nil
+
+-- "popup" action: summons the bubble on demand while the per-step popup is
+-- off, and dismisses it again.
+settings.language_japanese_sentence_popup = false
+settings.language_japanese_sentence_doublepress_next = "popup"
+pages[3] = "要求ポップアップの文。"
+current_page = 3
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgBack")) -- prev key plain: steps instantly
+pops_b4 = #popups
+check(ctrl.popup == nil, "per-step popup off: stepping shows no bubble")
+ctrl:onKeyPress(fake_key("LPgFwd"))
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(ctrl.popup ~= nil and #popups == pops_b4 + 1
+        and popups[#popups].text:find("要求ポップアップの文。", 1, true) ~= nil,
+    "double press summons the current sentence's popup on demand")
+pump(500)
+check(popups[#popups].text:find("EN:要求ポップアップの文。", 1, true) ~= nil,
+    "…and its translation is fetched and swapped in even in cursor mode")
+ctrl:onKeyPress(fake_key("LPgFwd"))
+ctrl:onKeyPress(fake_key("LPgFwd"))
+pump(500)
+check(ctrl.popup == nil, "a second double press dismisses the summoned popup")
+settings.language_japanese_sentence_doublepress_next = nil
+settings.language_japanese_sentence_popup = nil
 
 -- ======================= start at a byte offset ===========================
 
@@ -757,6 +851,55 @@ check(popups[#popups].text:find("LOCAL:オフラインローカルの文。", 1,
     "offline with the local translator: translations keep working")
 net.online = true
 plugin.localTranslatorOpts = nil
+
+-- ================== stale fetches are preempted ===========================
+-- Make subprocesses hang (their work runs only when released), so a step
+-- onto a new sentence finds the previous sentence's fetches still in flight.
+local ffistub = stubs["ffi/util"]
+local orig_run = ffistub.runInSubProcess
+local orig_done = ffistub.isSubProcessDone
+local orig_term = ffistub.terminateSubProcess
+local pending_procs = {} -- pid -> deferred subprocess body
+local killed = {}
+ffistub.runInSubProcess = function(fn)
+    subprocess_pid = subprocess_pid + 1
+    pending_procs[subprocess_pid] = fn
+    return subprocess_pid
+end
+ffistub.isSubProcessDone = function(pid) return pending_procs[pid] == nil end
+ffistub.terminateSubProcess = function(pid)
+    killed[#killed + 1] = pid
+    pending_procs[pid] = nil -- killed: its work never lands
+end
+
+pages[1] = "早い文。二番目の文。三番目の文。"
+current_page = 1
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(ctrl.fetch_wav ~= nil and ctrl.fetch_wav.text == "早い文。"
+        and ctrl.fetch_tr ~= nil and ctrl.fetch_tr.text == "早い文。",
+    "audio and translation fetch in parallel lanes, current sentence first")
+ctrl:onKeyPress(fake_key("LPgFwd")) -- step on before anything landed
+check(ctrl.fetch_wav ~= nil and ctrl.fetch_wav.text == "二番目の文。"
+        and ctrl.fetch_tr ~= nil and ctrl.fetch_tr.text == "二番目の文。",
+    "stepping preempts the stale fetches: both lanes serve the new sentence")
+check(#killed == 2, "the skipped sentence's subprocesses were killed")
+check((ctrl.wav_tries["早い文。"] or 0) == 0 and (ctrl.tr_tries["早い文。"] or 0) == 0,
+    "the aborted sentence's tries were refunded (abandoned, not failed)")
+-- Release the in-flight work and let the lookahead drain.
+for _ = 1, 30 do
+    local pid, fn = next(pending_procs)
+    if not pid then break end
+    fn(pid)
+    pending_procs[pid] = nil
+    pump(500)
+end
+check(popups[#popups].text:find("EN:二番目の文。", 1, true) ~= nil,
+    "the current sentence's translation lands (never queued behind stale work)")
+ctrl:stop()
+ffistub.runInSubProcess = orig_run
+ffistub.isSubProcessDone = orig_done
+ffistub.terminateSubProcess = orig_term
 
 -- toggle off restores the keys
 ctrl:applyKeys(false)

@@ -31,6 +31,8 @@ AutoReader.CHUNK_GAP_S = 0.05     -- pause between chunks within one sentence
 AutoReader.POLL_S = 0.3           -- fetch / still-playing poll interval
 AutoReader.CHUNK_MIN_BYTES = 30   -- don't cut speech chunks smaller than this
 AutoReader.MAX_SENT_BYTES = 300   -- hard cap per synthesized chunk
+AutoReader.SENT_CAP_BYTES = 600   -- hard cap per split sentence (quoted
+                                  -- dialogue can span several 。 units)
 AutoReader.HEAD_MAX_BYTES = 600   -- page-boundary sentence completion limit
 AutoReader.KEEP_SENTENCES = 120   -- cached chunk WAVs kept after a session
 AutoReader.MAX_FETCH_TRIES = 2    -- per chunk, before marking it failed
@@ -68,6 +70,19 @@ local CLOSERS = {
     [0x0027] = true, -- '
     [0x2019] = true, -- ’
     [0x201D] = true, -- ”
+}
+-- Quotation brackets tracked as pairs: terminators inside 「…」/『…』 do not
+-- end the sentence, so 「そうだ。行こう！」と言った。 stays one sentence
+-- (the quote, its closing bracket, and the narration up to the next
+-- terminator). Only these two unambiguous pairs are tracked — ASCII "quotes"
+-- can't be paired reliably, and parentheses rarely hold full sentences.
+local QUOTE_OPENERS = {
+    [0x300C] = true, -- 「
+    [0x300E] = true, -- 『
+}
+local QUOTE_CLOSERS = {
+    [0x300D] = true, -- 」
+    [0x300F] = true, -- 』
 }
 local COMMAS = {
     [0x3001] = true, -- 、
@@ -124,21 +139,29 @@ end
 
 --- Split a chunk into speakable sentences. A sentence ends at a terminator
 -- (。！？… etc., plus any directly following terminators/closing quotes) or a
--- newline (paragraph boundary). Over-long sentences are re-split at commas
--- (or hard-cut) to keep single synthesis requests sane.
+-- newline (paragraph boundary). Terminators inside 「…」/『…』 quotation
+-- brackets do not end the sentence: a quote runs to its closing bracket and
+-- on to the next terminator, so dialogue plus its narration stays one unit.
+-- A newline still cuts regardless (and resets the quote state), so a stray
+-- unclosed bracket can never glue paragraphs together. Over-long sentences
+-- are re-split at commas (or hard-cut) to keep single units sane.
+-- `init_depth` (optional) is the quote depth carried in from preceding text
+-- (page-boundary continuation).
 -- Returns sentences (array of strings), last_incomplete (true when the text
--- ran out mid-sentence — the caller may complete it from the next page).
-function AutoReader.splitSentences(text)
+-- ran out mid-sentence — the caller may complete it from the next page), and
+-- the quote depth still open at the end of the text.
+function AutoReader.splitSentences(text, init_depth)
     local sents = {}
     local last_incomplete = false
     local function push(s, incomplete)
         s = trim(s)
         if s == "" or not has_speakable(s) then return end
-        for _, piece in ipairs(AutoReader.capLength(s, AutoReader.MAX_SENT_BYTES)) do
+        for _, piece in ipairs(AutoReader.capLength(s, AutoReader.SENT_CAP_BYTES)) do
             sents[#sents + 1] = piece
         end
         last_incomplete = incomplete or false
     end
+    local depth = init_depth or 0
     local i, start = 1, 1
     local len = #text
     while i <= len do
@@ -147,8 +170,13 @@ function AutoReader.splitSentences(text)
         if cp == 0x0A then
             push(text:sub(start, i - 1), false)
             start = nxt
-        elseif TERMINATORS[cp]
-            or ((cp == 0x2E or cp == 0x21 or cp == 0x3F) and ascii_terminates(text, nxt)) then
+            depth = 0
+        elseif QUOTE_OPENERS[cp] then
+            depth = depth + 1
+        elseif QUOTE_CLOSERS[cp] then
+            depth = depth > 0 and depth - 1 or 0
+        elseif depth == 0 and (TERMINATORS[cp]
+            or ((cp == 0x2E or cp == 0x21 or cp == 0x3F) and ascii_terminates(text, nxt))) then
             -- consume any run of further terminators and closing quotes
             local j = nxt
             while j <= len do
@@ -169,7 +197,7 @@ function AutoReader.splitSentences(text)
     if start <= len then
         push(text:sub(start, len), true)
     end
-    return sents, last_incomplete
+    return sents, last_incomplete, depth
 end
 
 --- Re-split an over-long sentence at its last comma (、，,) before `max`
@@ -198,10 +226,14 @@ end
 
 --- The head of `text` up to and including its first sentence end (terminator
 -- run or newline), used to complete a page-spanning sentence with the next
--- page's beginning. Returns head (maybe ""), consumed_bytes — or nil when no
--- sentence end is found within max_bytes (then nothing is carried).
-function AutoReader.sentenceHead(text, max_bytes)
+-- page's beginning. `init_depth` (optional) is the quote depth left open by
+-- the sentence being completed, so a quote split across the page break is
+-- still carried through its closing 」 and on to the real sentence end.
+-- Returns head (maybe ""), consumed_bytes — or nil when no sentence end is
+-- found within max_bytes (then nothing is carried).
+function AutoReader.sentenceHead(text, max_bytes, init_depth)
     max_bytes = max_bytes or AutoReader.HEAD_MAX_BYTES
+    local depth = init_depth or 0
     local i = 1
     local len = #text
     while i <= len and i <= max_bytes do
@@ -210,8 +242,12 @@ function AutoReader.sentenceHead(text, max_bytes)
         if cp == 0x0A then
             return trim(text:sub(1, i - 1)), nxt - 1
         end
-        if TERMINATORS[cp]
-            or ((cp == 0x2E or cp == 0x21 or cp == 0x3F) and ascii_terminates(text, nxt)) then
+        if QUOTE_OPENERS[cp] then
+            depth = depth + 1
+        elseif QUOTE_CLOSERS[cp] then
+            depth = depth > 0 and depth - 1 or 0
+        elseif depth == 0 and (TERMINATORS[cp]
+            or ((cp == 0x2E or cp == 0x21 or cp == 0x3F) and ascii_terminates(text, nxt))) then
             local j = nxt
             while j <= len do
                 local cp2, l2 = Precache.utf8At(text, j)
@@ -505,13 +541,13 @@ function Controller:buildNextPage()
     if skip and skip > 0 then
         raw = raw:sub(skip + 1)
     end
-    local sents, last_incomplete = AutoReader.splitSentences(raw)
+    local sents, last_incomplete, open_depth = AutoReader.splitSentences(raw)
     -- Complete a sentence that runs over the page break with the next page's
     -- beginning, and remember how much of that page is already spoken for.
     if last_incomplete and #sents > 0 and page + 1 <= total then
         local nxt = p:pageText(page + 1)
         if nxt and nxt ~= "" then
-            local head, consumed = AutoReader.sentenceHead(nxt, AutoReader.HEAD_MAX_BYTES)
+            local head, consumed = AutoReader.sentenceHead(nxt, AutoReader.HEAD_MAX_BYTES, open_depth)
             if head then
                 if head ~= "" then
                     sents[#sents] = sents[#sents] .. head

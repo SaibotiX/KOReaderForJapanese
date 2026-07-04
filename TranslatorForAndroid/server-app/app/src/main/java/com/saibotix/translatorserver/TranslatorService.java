@@ -14,6 +14,7 @@ import android.util.Log;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -147,6 +148,40 @@ public class TranslatorService extends Service {
         }
     }
 
+    /**
+     * Number of "big" cores (cores whose max cpufreq equals the fastest
+     * core's). llama.cpp splits every matrix multiplication evenly across its
+     * threads and synchronizes per op, so on the big.LITTLE SoCs common in
+     * e-readers the little cores become the critical path: 4 big-core
+     * threads finish a token well before 8 mixed ones. Returns 0 when the
+     * cores are uniform or sysfs is unreadable (then llama-server's own
+     * default is used).
+     */
+    private static int bigCoreCount() {
+        int total = Runtime.getRuntime().availableProcessors();
+        long[] freqs = new long[total];
+        long maxFreq = 0;
+        for (int i = 0; i < total; i++) {
+            try (BufferedReader r = new BufferedReader(new FileReader(
+                    "/sys/devices/system/cpu/cpu" + i + "/cpufreq/cpuinfo_max_freq"))) {
+                freqs[i] = Long.parseLong(r.readLine().trim());
+            } catch (Exception e) {
+                freqs[i] = 0;
+            }
+            maxFreq = Math.max(maxFreq, freqs[i]);
+        }
+        if (maxFreq <= 0) {
+            return 0;
+        }
+        int big = 0;
+        for (long f : freqs) {
+            if (f == maxFreq) {
+                big++;
+            }
+        }
+        return (big > 0 && big < total) ? big : 0;
+    }
+
     /** Exec llama-server from the native lib dir with the extracted model. */
     private Process launchServer(File model) throws IOException {
         String exe = getApplicationInfo().nativeLibraryDir + "/libllamaserver.so";
@@ -163,6 +198,13 @@ public class TranslatorService extends Service {
         // One sentence at a time from KOReader: a single slot keeps RAM flat.
         cmd.add("--parallel");
         cmd.add("1");
+        // Pin the worker threads to the big-core count: with the default
+        // (all cores) every token waits for the slowest little core.
+        int threads = bigCoreCount();
+        if (threads > 0) {
+            cmd.add("-t");
+            cmd.add(String.valueOf(threads));
+        }
         // Read the model into RAM sequentially instead of mmap: on e-reader
         // flash (+ file-based encryption) mmap page-ins can stall the load
         // for minutes, which showed up as "loading model…" forever.

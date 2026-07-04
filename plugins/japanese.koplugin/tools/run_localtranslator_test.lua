@@ -20,11 +20,20 @@ end
 package.preload["json"] = function()
     return {
         decode = function(s)
-            -- Only the shapes the tests feed: OpenAI chat replies.
+            -- Only the shapes the tests feed: OpenAI chat replies, plain
+            -- ("message") and streamed ("delta") chunks.
             local content = s:match('"content"%s*:%s*"(.-[^\\])"')
+                or (s:find('"content"%s*:%s*""') and "")
             if s:find('"choices"') and content then
                 content = content:gsub('\\"', '"'):gsub("\\n", "\n"):gsub("\\\\", "\\")
-                return { choices = { { message = { content = content } } } }
+                local msg = { content = content }
+                if s:find('"delta"') then
+                    return { choices = { { delta = msg } } }
+                end
+                return { choices = { { message = msg } } }
+            end
+            if s:find('"delta"%s*:%s*{%s*}') or s:find('"delta":{"role"') then
+                return { choices = { { delta = {} } } }
             end
             if s == "{}" then return {} end
             error("bad json")
@@ -53,8 +62,11 @@ check(body:find('猫が\\"好き\\"\\u000A', 1, true) ~= nil
     or body:find('猫が\\"好き\\"', 1, true) ~= nil,
     "buildBody escapes quotes and control characters")
 check(body:find('"max_tokens":' .. LT.MAX_TOKENS, 1, true) ~= nil
-    and body:find('"stream":false', 1, true) ~= nil,
-    "buildBody sets bounded, non-streaming decoding")
+    and body:find('"stream":true', 1, true) ~= nil
+    and body:find('"cache_prompt":true', 1, true) ~= nil,
+    "buildBody sets bounded, streaming decoding with a warm prompt cache")
+check(LT.buildBody("言葉", 512):find('"max_tokens":512', 1, true) ~= nil,
+    "buildBody honors a max_tokens override (long selections)")
 
 -- ------------------------------------------------------------ parseReply --
 
@@ -62,6 +74,21 @@ check(LT.parseReply('{"choices":[{"message":{"content":"I like cats."}}]}')
     == "I like cats.", "parseReply extracts the assistant message")
 check(LT.parseReply("not json") == nil, "parseReply refuses garbage")
 check(LT.parseReply("{}") == nil, "parseReply refuses replies without choices")
+
+-- ------------------------------------------------------ parseStreamReply --
+
+local sse = table.concat({
+    'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+    'data: {"choices":[{"delta":{"content":"I like"}}]}',
+    'data: {"choices":[{"delta":{"content":" cats."}}]}',
+    "data: [DONE]",
+}, "\n\n")
+check(LT.parseStreamReply(sse) == "I like cats.",
+    "parseStreamReply reassembles the streamed deltas")
+check(LT.parseStreamReply('{"choices":[{"message":{"content":"plain"}}]}')
+    == "plain", "parseStreamReply falls through to plain replies")
+check(LT.parseStreamReply("data: not json\n\ndata: [DONE]") == nil,
+    "parseStreamReply refuses an unparseable stream")
 
 -- ------------------------------------------------------------- translate --
 
@@ -88,6 +115,14 @@ local req = make_requester({
 })
 local tr, err = LT.translate({ url = "http://pc:8087/" }, "猫が好きです。", req)
 check(tr == "I like cats.", "translate returns the trimmed translation: " .. tostring(err))
+
+local sse_req = make_requester({
+    { code = 200, body = 'data: {"choices":[{"delta":{"content":"Streamed"}}]}\n\n'
+        .. 'data: {"choices":[{"delta":{"content":" reply."}}]}\n\ndata: [DONE]\n\n' },
+})
+local tr_sse, err_sse = LT.translate({ url = "http://pc:8087" }, "文。", sse_req)
+check(tr_sse == "Streamed reply.",
+    "translate reassembles a streamed reply: " .. tostring(err_sse))
 check(req.calls[1].url == "http://pc:8087/v1/chat/completions"
     and req.calls[1].method == "POST"
     and req.calls[1].headers["Content-Type"] == "application/json",
