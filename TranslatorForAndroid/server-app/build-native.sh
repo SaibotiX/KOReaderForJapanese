@@ -38,11 +38,18 @@ fi
 # which Android's libc only exports from API 28 (the app's minSdk matches).
 # LLAMA_BUILD_UI=OFF: no embedded web UI (needs a network fetch at configure
 # time and is dead weight behind 127.0.0.1).
+# CMAKE_*_FLAGS_RELEASE must be passed explicitly: the NDK's legacy
+# android.toolchain.cmake replaces CMake's Release default (-O3 -DNDEBUG)
+# with just -DNDEBUG, so ggml silently built at -O0 — ~15x slower inference
+# (a sentence translation took minutes instead of seconds). The toolchain
+# prepends its -DNDEBUG to whatever is passed here.
 cmake -S "$SRC" -B "$BUILD" \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM=android-28 \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS_RELEASE="-O3" \
+    -DCMAKE_CXX_FLAGS_RELEASE="-O3" \
     -DBUILD_SHARED_LIBS=OFF \
     -DGGML_NATIVE=OFF \
     -DGGML_OPENMP=OFF \

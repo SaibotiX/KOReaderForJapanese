@@ -39,6 +39,27 @@ on purpose: dotprod/i8mm-optimized builds SIGILL on the A73/A53-class cores
 common in e-readers. If your device is newer, rebuild with e.g.
 `-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod` for a solid speedup.
 
+It also passes `-DCMAKE_C_FLAGS_RELEASE`/`-DCMAKE_CXX_FLAGS_RELEASE="-O3"`
+**explicitly**: the NDK's legacy `android.toolchain.cmake` replaces CMake's
+Release defaults (`-O3 -DNDEBUG`) with just `-DNDEBUG`, so without this ggml
+compiles at `-O0` — inference runs ~15x slower and a one-sentence
+translation takes minutes instead of seconds (shipped as v0.1.0; fixed in
+v0.1.1).
+
+## Performance / quality knobs
+
+There is no gradual quality-vs-speed dial in LLM inference — a generation
+either runs or it doesn't. The levers that do exist here:
+
+- **Quantization** (build-time): the bundled GGUF is Q4_K_M. On these
+  NEON-only cores a Q4_0 swap buys almost nothing: llama.cpp's fast
+  "repacked" Q4_0 kernels require dotprod, which A73/A53 lack — so Q4_K_M's
+  better quality is free. On a dotprod-capable device, rebuild with the arch
+  flag above *and* consider Q4_0 for the repack path.
+- **`max_tokens`** (KOReader side, `localtranslator.lua`): caps runaway
+  generations; normal sentences stop at EOS well before it.
+- **Threads**: already pinned to the big-core cluster (see below).
+
 The service launches the engine with `-t <number of big cores>` (cores whose
 `cpuinfo_max_freq` equals the fastest core's). llama.cpp splits each matmul
 evenly across its threads and synchronizes per op, so on big.LITTLE SoCs

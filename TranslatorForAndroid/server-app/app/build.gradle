@@ -13,8 +13,10 @@ android {
         // devices genuinely can't run it.
         minSdk 28
         targetSdk 28
-        versionCode 1
-        versionName '0.1.0 (LFM2-350M-ENJP-MT, llama.cpp)'
+        // Bumping versionCode re-extracts the (unchanged) model once — the
+        // extraction stamp is keyed by it.
+        versionCode 2
+        versionName '0.1.1 (LFM2-350M-ENJP-MT, llama.cpp)'
         ndk { abiFilters 'arm64-v8a' }
     }
 
