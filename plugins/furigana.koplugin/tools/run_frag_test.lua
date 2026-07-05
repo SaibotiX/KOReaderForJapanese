@@ -1,6 +1,6 @@
 -- Compare the Lua annotate_fragment against wrapper.py's annotate_html_fragment
 -- (frag_expected.lua). Usage:
---   /tmp/LuaJIT-2.1/src/luajit tools/run_frag_test.lua
+--   luajit tools/run_frag_test.lua
 package.path = package.path .. ";./?.lua"
 
 local Tokenizer = require("tokenizer")

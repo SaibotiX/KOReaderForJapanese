@@ -18,13 +18,19 @@ local M = {}
 -- invalidate previously generated copies (main.lua bakes it into the cache
 -- key). 2: verified archive output — a write that failed midway (device out
 -- of space) used to be kept silently, and such a truncated EPUB rendered as
--- a book cut off at its first picture.
-M.OUTPUT_VERSION = 2
+-- a book cut off at its first picture. 3: HTML implied-end-tag ruby
+-- (<ruby>来<rt>く</ruby>, no </rt> — how browsers and page savers emit it)
+-- used to leak the skip/drop depth: strip_ruby discarded everything after
+-- the document's first such <ruby> and annotate_fragment stopped annotating
+-- there.
+M.OUTPUT_VERSION = 3
 
--- Tags whose text content must not be annotated (matches wrapper.py _SKIP_TAGS).
+-- Tags whose text content must not be annotated (matches wrapper.py
+-- _SKIP_TAGS). Ruby-family tags are tracked separately (see ruby_event):
+-- unlike these, their end tags may legally be omitted, so a bare depth
+-- counter leaks on real-world HTML.
 local SKIP_TAGS = {
     script = true, style = true, head = true,
-    ruby = true, rt = true, rp = true, rb = true, rtc = true,
 }
 
 -- Japanese Unicode ranges (matches wrapper.py has_japanese).
@@ -60,6 +66,79 @@ local function is_annotated(s)
     return s:find("<ruby>", 1, true) ~= nil and s:find("<rt>", 1, true) ~= nil
 end
 
+-- ---------------------------------------------------------- ruby tracking --
+
+-- HTML allows </rb>/<rt>/<rp>/<rtc> end tags to be omitted: the element is
+-- closed implicitly by the next ruby-family start tag or by </ruby>.
+-- Browsers — and page savers like SingleFile — really emit
+-- `<ruby>来<rp>(<rt>く<rp>)</ruby>`, so ruby must be tracked with a stack
+-- that applies those rules; counting opens against closes never returns to
+-- zero on such markup.
+local RUBY_FAMILY = { ruby = true, rb = true, rt = true, rp = true, rtc = true }
+-- Elements holding the annotation (reading) itself; their text is what
+-- strip_ruby discards. <ruby>/<rb> merely wrap base text.
+local RUBY_ANNOT = { rt = true, rp = true, rtc = true }
+-- What a start tag implicitly closes first. <rt>/<rp> nest inside <rtc>,
+-- so they leave an open <rtc> alone; <rb>/<rtc> close any pending sibling.
+local RUBY_IMPLIED_CLOSE = {
+    ruby = {},
+    rb  = { rb = true, rt = true, rp = true, rtc = true },
+    rtc = { rb = true, rt = true, rp = true, rtc = true },
+    rt  = { rb = true, rt = true, rp = true },
+    rp  = { rb = true, rt = true, rp = true },
+}
+-- End tags of elements that cannot sit inside <ruby>: reaching one means
+-- every open ruby-family element was implicitly closed (browsers pop them
+-- the same way). Stop-loss so one unclosed <ruby> in broken markup can't
+-- swallow the rest of the document.
+local RUBY_BOUNDARY = {
+    p = true, div = true, li = true, ul = true, ol = true, dl = true,
+    dt = true, dd = true, td = true, th = true, tr = true, table = true,
+    h1 = true, h2 = true, h3 = true, h4 = true, h5 = true, h6 = true,
+    blockquote = true, section = true, article = true, aside = true,
+    main = true, header = true, footer = true, figure = true,
+    figcaption = true, pre = true, body = true, html = true,
+}
+
+local function ruby_stack_new()
+    return { n = 0, annot = 0 } -- annot = open <rt>/<rp>/<rtc> count
+end
+
+local function ruby_push(st, name)
+    st.n = st.n + 1; st[st.n] = name
+    if RUBY_ANNOT[name] then st.annot = st.annot + 1 end
+end
+
+local function ruby_pop(st)
+    local name = st[st.n]
+    st[st.n] = nil; st.n = st.n - 1
+    if RUBY_ANNOT[name] then st.annot = st.annot - 1 end
+end
+
+local function ruby_clear(st)
+    while st.n > 0 do ruby_pop(st) end
+end
+
+-- Feed one ruby-family tag through the stack.
+local function ruby_event(st, slash, name, selfclose)
+    if slash == "/" then
+        -- Close the nearest matching open element; everything above it on
+        -- the stack closes implicitly with it. A </rb|rt|rp|rtc> never
+        -- reaches past its <ruby>; a stray close tag is ignored.
+        for k = st.n, 1, -1 do
+            if st[k] == name then
+                for _ = k, st.n do ruby_pop(st) end
+                return
+            end
+            if st[k] == "ruby" then return end
+        end
+    else
+        local implied = RUBY_IMPLIED_CLOSE[name]
+        while st.n > 0 and implied[st[st.n]] do ruby_pop(st) end
+        if not selfclose then ruby_push(st, name) end
+    end
+end
+
 --- Annotate Japanese text nodes in an XHTML string, leaving markup untouched.
 -- Faithful port of wrapper.py annotate_html_fragment.
 -- @param tokenizer a furigana tokenizer with an :annotate(text) method
@@ -67,15 +146,20 @@ end
 -- @treturn string annotated markup
 function M.annotate_fragment(tokenizer, markup)
     local out, on = {}, 0
-    local skip_depth = 0
+    local skip_depth = 0 -- open <script>/<style>/<head>
+    local ruby = ruby_stack_new() -- existing ruby is never re-annotated
     local i, len = 1, #markup
+
+    local function skipping()
+        return skip_depth > 0 or ruby.n > 0
+    end
 
     while i <= len do
         local lt = markup:find("<", i, true)
         if not lt then
             -- trailing text node
             local part = markup:sub(i)
-            if skip_depth == 0 and has_japanese(part) and not is_annotated(part) then
+            if not skipping() and has_japanese(part) and not is_annotated(part) then
                 part = tokenizer:annotate(part)
             end
             on = on + 1; out[on] = part
@@ -83,7 +167,7 @@ function M.annotate_fragment(tokenizer, markup)
         end
         if lt > i then
             local part = markup:sub(i, lt - 1)
-            if skip_depth == 0 and has_japanese(part) and not is_annotated(part) then
+            if not skipping() and has_japanese(part) and not is_annotated(part) then
                 part = tokenizer:annotate(part)
             end
             on = on + 1; out[on] = part
@@ -92,7 +176,7 @@ function M.annotate_fragment(tokenizer, markup)
         if not gt then
             -- stray '<' with no closing '>': treat the rest as a text node
             local part = markup:sub(lt)
-            if skip_depth == 0 and has_japanese(part) and not is_annotated(part) then
+            if not skipping() and has_japanese(part) and not is_annotated(part) then
                 part = tokenizer:annotate(part)
             end
             on = on + 1; out[on] = part
@@ -104,11 +188,18 @@ function M.annotate_fragment(tokenizer, markup)
         local slash, name = tag:match("^<%s*(/?)%s*([%a][%w_:%-]*)")
         if name then
             name = name:lower()
-            if SKIP_TAGS[name] and tag:sub(-2) ~= "/>" then
-                if slash == "/" then
-                    skip_depth = skip_depth > 0 and skip_depth - 1 or 0
-                else
-                    skip_depth = skip_depth + 1
+            if RUBY_FAMILY[name] then
+                ruby_event(ruby, slash, name, tag:sub(-2) == "/>")
+            else
+                if ruby.n > 0 and slash == "/" and RUBY_BOUNDARY[name] then
+                    ruby_clear(ruby)
+                end
+                if SKIP_TAGS[name] and tag:sub(-2) ~= "/>" then
+                    if slash == "/" then
+                        skip_depth = skip_depth > 0 and skip_depth - 1 or 0
+                    else
+                        skip_depth = skip_depth + 1
+                    end
                 end
             end
         end
@@ -118,24 +209,19 @@ function M.annotate_fragment(tokenizer, markup)
     return table.concat(out)
 end
 
--- Ruby tags whose annotation content (the reading) is discarded entirely.
-local RUBY_DROP_CONTENT = { rt = true, rtc = true, rp = true }
--- Ruby wrapper tags dropped while keeping their (base) content.
-local RUBY_DROP_TAG = { ruby = true, rb = true }
-
 --- Remove embedded/publisher furigana, keeping the base text, so it can be
 -- re-annotated from scratch. Drops <rt>/<rtc>/<rp> with their contents and
--- unwraps <ruby>/<rb>, leaving everything else untouched.
--- @param tokenizer (unused; kept for call-site symmetry) — pass nil
+-- unwraps <ruby>/<rb>, leaving everything else untouched. Handles HTML
+-- implied end tags (see ruby_event).
 -- @param markup XHTML/HTML document text
 -- @treturn string markup with ruby annotation removed
 function M.strip_ruby(markup)
     local out, on = {}, 0
-    local drop = 0 -- depth inside <rt>/<rtc>/<rp> (content discarded)
+    local ruby = ruby_stack_new()
     local i, len = 1, #markup
 
     local function emit_text(s)
-        if drop == 0 then on = on + 1; out[on] = s end
+        if ruby.annot == 0 then on = on + 1; out[on] = s end
     end
 
     while i <= len do
@@ -152,19 +238,19 @@ function M.strip_ruby(markup)
         local slash, name = tag:match("^<%s*(/?)%s*([%a][%w_:%-]*)")
         if name then
             name = name:lower()
-            local selfclose = tag:sub(-2) == "/>"
-            if RUBY_DROP_CONTENT[name] then
-                if not selfclose then
-                    if slash == "/" then drop = drop > 0 and drop - 1 or 0
-                    else drop = drop + 1 end
+            if RUBY_FAMILY[name] then
+                -- never emitted: annotation containers vanish with their
+                -- contents, <ruby>/<rb> are unwrapped around the base text
+                ruby_event(ruby, slash, name, tag:sub(-2) == "/>")
+            else
+                if ruby.n > 0 and slash == "/" and RUBY_BOUNDARY[name] then
+                    ruby_clear(ruby)
                 end
-                -- the tag itself is never emitted
-            elseif RUBY_DROP_TAG[name] then
-                -- unwrap: drop the tag, keep the (base) content
-            elseif drop == 0 then
-                on = on + 1; out[on] = tag
+                if ruby.annot == 0 then
+                    on = on + 1; out[on] = tag
+                end
             end
-        elseif drop == 0 then
+        elseif ruby.annot == 0 then
             on = on + 1; out[on] = tag -- comment / declaration
         end
         i = gt + 1

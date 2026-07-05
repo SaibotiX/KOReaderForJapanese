@@ -2,7 +2,7 @@
 -- line's output to bridge.js ground truth (tools/expected.lua).
 --
 -- Usage (from the plugin dir):
---   /tmp/LuaJIT-2.1/src/luajit tools/run_test.lua
+--   luajit tools/run_test.lua
 --
 -- Exits non-zero if any line differs.
 
