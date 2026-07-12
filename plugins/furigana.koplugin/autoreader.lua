@@ -137,6 +137,70 @@ local function ascii_terminates(text, next_i)
     return true
 end
 
+-- The position right after a run of terminators/closers starting at byte `j`
+-- (the punctuation that piles up after a sentence end: 。」』…!?).
+local function consume_enders(text, j)
+    local len = #text
+    while j <= len do
+        local cp, l = Precache.utf8At(text, j)
+        if TERMINATORS[cp] or CLOSERS[cp] or cp == 0x2E or cp == 0x21 or cp == 0x3F then
+            j = j + l
+        else
+            break
+        end
+    end
+    return j
+end
+
+-- Whether the quote closing at byte position `i` ended in a terminator: the
+-- last codepoint before it that is not itself a closer (。」 directly, or
+-- through piled-up closers like 。』」) must be one. False when the scan runs
+-- off the start of the text — that information lies on the previous page, so
+-- the caller must not cut there.
+local function terminator_before_closer(text, i)
+    local pos = i
+    while pos > 1 do
+        pos = pos - 1
+        while pos > 1 and text:byte(pos) >= 0x80 and text:byte(pos) < 0xC0 do
+            pos = pos - 1 -- back up over UTF-8 continuation bytes
+        end
+        local cp = Precache.utf8At(text, pos)
+        if TERMINATORS[cp] or cp == 0x2E or cp == 0x21 or cp == 0x3F then
+            return true
+        end
+        if not CLOSERS[cp] then
+            return false
+        end
+    end
+    return false
+end
+
+-- Whether a new sentence (or nothing at all) follows byte position `j`,
+-- looking through spaces: an opening quote, a newline or the end of the text.
+-- Regular text there (「…。」と言った) means the sentence continues.
+local function quote_boundary_after(text, j)
+    local k = j
+    while k <= #text do
+        local cp, l = Precache.utf8At(text, k)
+        if not is_space_cp(cp) then
+            return cp == 0x0A or QUOTE_OPENERS[cp] == true
+        end
+        k = k + l
+    end
+    return true -- end of text
+end
+
+-- Whether only spaces remain after byte position `j`.
+local function end_of_text_after(text, j)
+    local k = j
+    while k <= #text do
+        local cp, l = Precache.utf8At(text, k)
+        if not is_space_cp(cp) then return false end
+        k = k + l
+    end
+    return true
+end
+
 --- Split a chunk into speakable sentences. A sentence ends at a terminator
 -- (。！？… etc., plus any directly following terminators/closing quotes) or a
 -- newline (paragraph boundary). Terminators inside 「…」/『…』 quotation
@@ -175,19 +239,33 @@ function AutoReader.splitSentences(text, init_depth)
             depth = depth + 1
         elseif QUOTE_CLOSERS[cp] then
             depth = depth > 0 and depth - 1 or 0
+            -- A closed quote can end the sentence. Without this, a page
+            -- ending in a closed dialogue line counted as incomplete and the
+            -- NEXT page's first quote was glued onto it (「文一。」+「文二。」).
+            --  * terminator-closed (…。」): complete when followed by another
+            --    opening quote, a newline, or the end of the text — narration
+            --    after it (「…。」と言った。) still runs to its own terminator;
+            --  * no terminator (…そうだ」 — many books omit the 。 before 」):
+            --    complete only at the very end of the text, so noun quotes
+            --    (彼の言う「自由」「平等」…) are never cut mid-sentence.
+            if depth == 0 then
+                local j = consume_enders(text, nxt)
+                local complete
+                if terminator_before_closer(text, i) then
+                    complete = quote_boundary_after(text, j)
+                else
+                    complete = end_of_text_after(text, j)
+                end
+                if complete then
+                    push(text:sub(start, j - 1), false)
+                    start = j
+                    nxt = j
+                end
+            end
         elseif depth == 0 and (TERMINATORS[cp]
             or ((cp == 0x2E or cp == 0x21 or cp == 0x3F) and ascii_terminates(text, nxt))) then
             -- consume any run of further terminators and closing quotes
-            local j = nxt
-            while j <= len do
-                local cp2, l2 = Precache.utf8At(text, j)
-                if TERMINATORS[cp2] or CLOSERS[cp2]
-                    or cp2 == 0x2E or cp2 == 0x21 or cp2 == 0x3F then
-                    j = j + l2
-                else
-                    break
-                end
-            end
+            local j = consume_enders(text, nxt)
             push(text:sub(start, j - 1), false)
             start = j
             nxt = j
@@ -246,18 +324,30 @@ function AutoReader.sentenceHead(text, max_bytes, init_depth)
             depth = depth + 1
         elseif QUOTE_CLOSERS[cp] then
             depth = depth > 0 and depth - 1 or 0
-        elseif depth == 0 and (TERMINATORS[cp]
-            or ((cp == 0x2E or cp == 0x21 or cp == 0x3F) and ascii_terminates(text, nxt))) then
-            local j = nxt
-            while j <= len do
-                local cp2, l2 = Precache.utf8At(text, j)
-                if TERMINATORS[cp2] or CLOSERS[cp2]
-                    or cp2 == 0x2E or cp2 == 0x21 or cp2 == 0x3F then
-                    j = j + l2
+            -- Same rule as splitSentences: a terminator-closed quote followed
+            -- by an opening quote / newline / the end of the text completes
+            -- the carried sentence right there, instead of running on into
+            -- the next (unrelated) quote; without a terminator, only the end
+            -- of the text completes it (a carried quote closing bare at the
+            -- very end of the next page used to return nil and lose its
+            -- completion). When the terminator sits on the previous page
+            -- (the closer is this text's first character),
+            -- terminator_before_closer can't see it and we keep scanning.
+            if depth == 0 then
+                local j = consume_enders(text, nxt)
+                local complete
+                if terminator_before_closer(text, i) then
+                    complete = quote_boundary_after(text, j)
                 else
-                    break
+                    complete = end_of_text_after(text, j)
+                end
+                if complete then
+                    return trim(text:sub(1, j - 1)), j - 1
                 end
             end
+        elseif depth == 0 and (TERMINATORS[cp]
+            or ((cp == 0x2E or cp == 0x21 or cp == 0x3F) and ascii_terminates(text, nxt))) then
+            local j = consume_enders(text, nxt)
             return trim(text:sub(1, j - 1)), j - 1
         end
         i = nxt
@@ -395,12 +485,8 @@ function Controller:start()
         self:notify(_("Auto reader works in EPUB/HTML books only."))
         return
     end
-    if p:isShowingAnnotated() then
-        -- Extracted text of an annotated copy interleaves the ruby readings,
-        -- which would be read out twice.
-        self:notify(_("Auto reader works in the original book — turn 'Show furigana for current book' off first."))
-        return
-    end
+    -- Annotated copies work too: pageText strips the ruby readings from the
+    -- extracted text (they used to interleave and would be read out twice).
     self.opts = p:voicevoxOpts()
     if not self.opts.url or self.opts.url == "" then
         self:notify(_("Configure the VOICEVOX server URL first."))

@@ -128,9 +128,23 @@ local function is_fallback_cp(cp)
         and not (cp >= 0x30FC and cp <= 0x30FE) -- ー ヽ ヾ
 end
 
+-- A codepoint the annotator isolates into its own <ruby> base text node:
+-- kanji, the 々 iteration mark, or a full-width digit (which gets a number
+-- reading). Anything a search anchor in the ANNOTATED copy must not span —
+-- shared by main.lua's position-restore anchors and the sentence reader's
+-- annotated-copy needles, so all three stay byte-range-identical.
+local function is_ruby_base_cp(cp)
+    return (cp >= 0x4E00 and cp <= 0x9FFF)   -- CJK Unified Ideographs
+        or (cp >= 0x3400 and cp <= 0x4DBF)   -- CJK Extension A
+        or (cp >= 0xF900 and cp <= 0xFAFF)   -- CJK Compatibility Ideographs
+        or cp == 0x3005                      -- 々 (kanji iteration mark)
+        or (cp >= 0xFF10 and cp <= 0xFF19)   -- full-width digits ０-９
+end
+
 -- Shared with autoreader.lua (sentence splitting walks the same codepoints).
 Precache.utf8At = utf8_at
 Precache.isWordCp = is_word_cp
+Precache.isRubyBaseCp = is_ruby_base_cp
 
 --- Scan `text` the way a tap would: for every Japanese character, collect the
 -- prefixes a tap there would try (2..max_scan+1 characters, stopping at

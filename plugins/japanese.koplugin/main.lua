@@ -999,8 +999,9 @@ end
 
 --- Start the sentence reader at the sentence containing xpointer `pos0` (the
 -- start of a text selection). The byte offset within the page text is
--- computed with the same extraction pageText() uses, so the sentence indices
--- line up.
+-- computed with the same extraction pageText() uses — the furigana plugin's
+-- extractText, which strips the ruby readings in an annotated copy — so the
+-- sentence indices line up.
 function Japanese:startSentencesAt(pos0)
     if not self:isSentenceSplittingEnabled() then
         self:setSentenceSplitting(true)
@@ -1011,7 +1012,16 @@ function Japanese:startSentencesAt(pos0)
         local doc = self.ui.document
         local page = doc:getCurrentPage()
         local xp0 = doc:getPageXPointer(page)
-        local prefix = doc:getTextFromXPointers(xp0, pos0) or ""
+        local furigana = self.ui.furigana
+        local prefix
+        if furigana and furigana.extractText then
+            -- extractText already falls back to the raw extraction in a
+            -- normal book; in an annotated copy a raw fallback here would
+            -- count the interleaved readings and overshoot the offset.
+            prefix = furigana:extractText(xp0, pos0) or ""
+        else
+            prefix = doc:getTextFromXPointers(xp0, pos0) or ""
+        end
         return #prefix + 1
     end)
     ctrl:startAt(ok and byte_pos or 1)
@@ -1242,7 +1252,7 @@ You can also bind “Analyse Japanese word” to a gesture under Gestures.]]),
         help_text = _([[
 Read the book sentence by sentence with the volume/page-turn keys. Each press moves a faint marker onto the sentence's first character and — per the "On each step" toggles — speaks it through VOICEVOX, and/or shows it (with furigana) and its translation in a popup right above the sentence. Audio and translation of the next two sentences are prepared in the background, so stepping forward is smooth.
 
-While enabled, the keys step sentences instead of turning pages (tapping still turns them). Tap the popup to show/hide the translation, double-tap to replay the audio; hold text on the popup to look it up in the dictionary. You can also long-press text on the page and choose 'Read sentences from here'. Needs the Furigana plugin.]]),
+While enabled, the keys step sentences instead of turning pages (tapping still turns them). Tap the popup to show/hide the translation, double-tap to replay the audio, double-tap its left edge to dismiss it; hold a word on it for a dictionary lookup (expanded like a hold on the page). The popup stays up while you use the reader beneath it (see 'Popup: keep it up'). You can also long-press text on the page and choose 'Read sentences from here'. Needs the Furigana plugin.]]),
         sub_item_table = {
             {
                 text = _("Volume keys read sentences"),
@@ -1293,7 +1303,19 @@ While enabled, the keys step sentences instead of turning pages (tapping still t
                     G_reader_settings:flipNilOrTrue("language_japanese_sentence_furigana")
                     if touchmenu_instance then touchmenu_instance:updateItems() end
                 end,
-                help_text = _("Splice each word's reading into the sentence shown in the popup, e.g. 私（わたし）は行（い）く。 Uses the Furigana plugin's dictionary (the first sentence loads it, which takes a moment)."),
+                help_text = _("Show each word's reading above it in the popup, as ruby — like the annotated book would. The ruby size follows the reader's Ruby style tweaks (Style tweaks → Text → Ruby). Uses the Furigana plugin's dictionary (the first sentence loads it, which takes a moment)."),
+            },
+            {
+                text = _("Popup: keep it up (sticky)"),
+                checked_func = function() return G_reader_settings:nilOrTrue("language_japanese_sentence_popup_sticky") end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:flipNilOrTrue("language_japanese_sentence_popup_sticky")
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _([[Keep the popup up while you use the reader beneath it: taps, holds (dictionary lookups), menus and page turns all pass through instead of dismissing it. Double-tap the popup's left edge (the leftmost eighth) to dismiss it; stepping brings it back.
+
+Off: any tap or swipe outside the popup closes it, like before.]]),
             },
             {
                 text = _("Popup: show the translation"),

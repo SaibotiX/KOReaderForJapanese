@@ -640,9 +640,34 @@ function Furigana:onPageUpdate(page)
     self:precacheSchedule()
 end
 
+--- The visible text between two xpointers. In an annotated copy the raw
+-- crengine extraction interleaves every ruby reading with its base text
+-- (私わたしは学校がっこう…), so there the range's HTML is taken instead and
+-- the ruby stripped — the result matches what the original book's extraction
+-- gives, so sentence audio/translation caches are shared between the two.
+function Furigana:extractText(xp0, xp1)
+    local doc = self.ui and self.ui.document
+    if not doc then return nil end
+    if self:isShowingAnnotated() then
+        -- Never fall back to the raw extraction here: reading-interleaved
+        -- text would be spoken with every reading twice and would break the
+        -- splitter — nil (nothing to read) is the safer failure.
+        if not doc.getHTMLFromXPointers then return nil end
+        local ok, text = pcall(function()
+            local html = doc:getHTMLFromXPointers(xp0, xp1, 0x1001)
+            if not html or html == "" then return nil end
+            return EpubAnnotator.html_to_text(EpubAnnotator.strip_ruby(html))
+        end)
+        return (ok and text ~= "" and text) or nil
+    end
+    local ok, text = pcall(doc.getTextFromXPointers, doc, xp0, xp1)
+    return ok and text or nil
+end
+
 --- The text of one rendered page (page top to next page top; the last page
--- walks to the end of the book). Shared by the precache window capture and
--- the auto reader. Returns nil when it can't be had.
+-- walks to the end of the book). Shared by the precache window capture, the
+-- auto reader and the sentence reader. Reading-free even in an annotated
+-- copy (see extractText). Returns nil when it can't be had.
 function Furigana:pageText(page)
     local doc = self.ui and self.ui.document
     if not doc then return nil end
@@ -651,7 +676,7 @@ function Furigana:pageText(page)
         if not xp0 then return nil end
         if page + 1 <= doc:getPageCount() then
             local xp1 = doc:getPageXPointer(page + 1)
-            if xp1 then return doc:getTextFromXPointers(xp0, xp1) end
+            if xp1 then return self:extractText(xp0, xp1) end
         end
         local e = xp0
         for _ = 1, 800 do
@@ -659,7 +684,7 @@ function Furigana:pageText(page)
             if not nxt or nxt == e then break end
             e = nxt
         end
-        if e ~= xp0 then return doc:getTextFromXPointers(xp0, e) end
+        if e ~= xp0 then return self:extractText(xp0, e) end
         return nil
     end)
     return ok and text or nil
@@ -847,17 +872,12 @@ end
 -- match. The helpers below find runs of text that annotation leaves contiguous,
 -- so we still have something searchable in the annotated copy.
 
--- A codepoint that annotation isolates into its own <ruby> base text node:
--- kanji, the 々 iteration mark, or a full-width digit (which gets a number
--- reading). A search anchor must not span any of these. Everything else (kana,
--- latin, punctuation…) is emitted as plain, contiguous text.
-local function cp_in_ruby_base(cp)
-    return (cp >= 0x4E00 and cp <= 0x9FFF)   -- CJK Unified Ideographs
-        or (cp >= 0x3400 and cp <= 0x4DBF)   -- CJK Extension A
-        or (cp >= 0xF900 and cp <= 0xFAFF)   -- CJK Compatibility Ideographs
-        or cp == 0x3005                      -- 々 (kanji iteration mark)
-        or (cp >= 0xFF10 and cp <= 0xFF19)   -- full-width digits ０-９
-end
+-- A codepoint that annotation isolates into its own <ruby> base text node
+-- (kanji, 々, full-width digits): a search anchor must not span any of
+-- these. Everything else (kana, latin, punctuation…) is emitted as plain,
+-- contiguous text. Shared definition: precache.lua (the sentence reader's
+-- annotated-copy needles use the same one).
+local cp_in_ruby_base = require("precache").isRubyBaseCp
 
 -- "Wordish" = a kana or Latin letter; used to keep anchors distinctive rather
 -- than runs of bare punctuation/whitespace.
@@ -988,12 +1008,10 @@ function Furigana:capturePageMarker()
         local html = doc:getHTMLFromXPointers(top_xp, end_xp, 0x1001)
         if not html or html == "" then return nil end
         html = clip_to_first_block(html)        -- never cross a block boundary
-        html = EpubAnnotator.strip_ruby(html)
-        local text = (html:gsub("<[^>]*>", "")) -- drop remaining tags
-        -- Decode the common named entities so the marker matches crengine's
-        -- rendered text on the target side.
-        text = text:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
-                   :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+        -- Flatten with the shared helper (tags dropped, entities decoded —
+        -- numeric ones included, unlike the old inline copy); the marker is
+        -- a single line, so the newlines it keeps become spaces below.
+        local text = EpubAnnotator.html_to_text(EpubAnnotator.strip_ruby(html))
         text = util.cleanupSelectedText(text)
         text = (text:gsub("[\r\n]+", " "):gsub("%s%s+", " "))
         text = (text:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -1559,7 +1577,6 @@ Applies to audio fetched from now on — already-cached audio keeps its old leve
                         end,
                         enabled_func = function()
                             return self.ui ~= nil and self.ui.rolling ~= nil
-                                and not self:isShowingAnnotated()
                         end,
                         callback = function(touchmenu_instance)
                             if touchmenu_instance then touchmenu_instance:closeMenu() end
@@ -1567,7 +1584,7 @@ Applies to audio fetched from now on — already-cached audio keeps its old leve
                         end,
                         help_text = _([[Read the book aloud through VOICEVOX: starting at the top of the current page, every sentence is spoken in order, pages turn by themselves, and upcoming sentences are synthesized while one is playing, so the audio flows without interruptions.
 
-Tap the page (or turn it yourself) to stop. Works in the original (un-annotated) book. 'Auto reader (VOICEVOX)' can also be bound to a gesture.]]),
+Tap the page (or turn it yourself) to stop. Works in the original book and in the annotated furigana copy alike. 'Auto reader (VOICEVOX)' can also be bound to a gesture.]]),
                     },
                     {
                         text = _("Test audio (食べる)"),

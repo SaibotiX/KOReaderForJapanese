@@ -7,11 +7,15 @@
 -- small popup right above the sentence (below it when there is no room;
 -- bottom of the screen only when it cannot be located at all — shortened
 -- prefixes and occurrence counting locate it through inline formatting).
--- The popup holds the sentence with furigana spliced in (toggleable; the
--- Japanese line itself can be hidden to leave only the translation) and its
--- translation underneath (local LLM server first when configured, Google
--- otherwise; swapped in as soon as it arrives). Text on the popup can be
--- hold-selected for a dictionary lookup. Stepping past either end of the
+-- The popup holds the sentence with furigana as real interlinear ruby —
+-- readings above the words, sized per the book's Ruby style tweaks
+-- (toggleable; the Japanese line itself can be hidden to leave only the
+-- translation) and its translation underneath (local LLM server first when
+-- configured, Google otherwise; swapped in as soon as it arrives). A hold on
+-- a word looks it up like a hold on the book page would (Yomichan expansion
+-- on the plain sentence — see Controller:lookupWord); the popup is sticky by
+-- default (taps/swipes outside act on the page beneath; a double tap on its
+-- left eighth dismisses it). Stepping past either end of the
 -- page turns it; a sentence that runs across a page boundary is completed
 -- with the next page's beginning, exactly like the auto reader. A double
 -- press of a stepping key runs that key's own configured action (media
@@ -118,17 +122,39 @@ function SentenceSplitting.computeSkip(prev_text, text)
     return 0
 end
 
---- The popup line for a sentence with furigana spliced in after each
--- annotated run, e.g. 私（わたし）は学校（がっこう）へ行（い）った。
--- `annotated` is the tokenizer's ruby HTML for `original`. Returns nil when
--- the annotation cannot be trusted (round-trip mismatch); the caller falls
--- back to the bare sentence.
-function SentenceSplitting.rubyDisplay(annotated, original)
+--- The ruby runs for a sentence, for the popup's interlinear display (the
+-- readings are rendered ABOVE the words by rubytext.lua, like the book
+-- itself would). `annotated` is the tokenizer's ruby HTML for `original`.
+-- Returns the runs array (byte offsets into `original`; possibly empty for
+-- kana-only sentences) — or nil when the annotation cannot be trusted
+-- (round-trip mismatch); the caller falls back to the bare sentence.
+function SentenceSplitting.rubyRuns(annotated, original)
     local ReadingExtractor = require("readingextractor")
     local runs, plain = ReadingExtractor.parse(annotated)
     if plain ~= original then return nil end
-    if #runs == 0 then return original end
-    return ReadingExtractor.display(plain, runs, 0, #plain) or original
+    return runs
+end
+
+--- The rt font-size percentage set by a stylesheet snippet, e.g. KOReader's
+-- "Larger ruby text size" style tweak (`rt, rubyBox[T=rt] { font-size: 50%
+-- !important; }`). Decimal values ("87.5%" — a greedy %d+ would capture the
+-- "5" of ".5%"!) and em units ("0.6em" → 60) are understood too. nil when
+-- the css doesn't size rt.
+function SentenceSplitting.rubySizeFromCss(css)
+    if type(css) ~= "string" then return nil end
+    local found
+    for sel, body in css:gmatch("([^{}]+)%{([^{}]*)%}") do
+        if sel:find("%f[%w]rt%f[%W]") then
+            local pct = body:match("font%-size%s*:%s*(%d+%.?%d*)%s*%%")
+            if pct then
+                found = tonumber(pct)
+            else
+                local em = body:match("font%-size%s*:%s*(%d*%.?%d+)%s*em")
+                if em then found = tonumber(em) * 100 end
+            end
+        end
+    end
+    return found
 end
 
 -- The first `n_chars` codepoints of a UTF-8 string.
@@ -140,6 +166,17 @@ local function utf8_prefix(s, n_chars)
         count = count + 1
     end
     return s:sub(1, i - 1)
+end
+
+-- Codepoint count of a UTF-8 string.
+local function utf8_count(s)
+    local i, count = 1, 0
+    while i <= #s do
+        local _, len = Precache.utf8At(s, i)
+        i = i + len
+        count = count + 1
+    end
+    return count
 end
 
 --- Progressively simpler search needles for locating a sentence on the page.
@@ -170,6 +207,74 @@ function SentenceSplitting.anchorNeedles(sentence, carry_len)
         add(utf8_prefix(line, n_chars))
     end
     return needles
+end
+
+-- Codepoints the annotator isolates into their own <ruby> base text node: a
+-- search needle for the annotated copy must not cross their boundaries,
+-- everything else stays contiguous text there. One definition, shared with
+-- the furigana plugin's own annotated-copy anchors.
+local cp_in_ruby_base = Precache.isRubyBaseCp
+
+--- Needles for locating a sentence in the ANNOTATED furigana copy, where
+-- <ruby> splits the page's base text into many small nodes (crengine's
+-- findText only matches within one node). A sentence starting with kana or
+-- punctuation is found by its leading never-annotated run (contiguous in the
+-- copy) and shorter prefixes of it; one starting with kanji by its first
+-- annotated word's base text (`runs` — the popup's tokenization — when it
+-- starts the sentence). A single leading character can never span a node
+-- boundary, so it is always the last resort.
+function SentenceSplitting.anchorNeedlesAnnotated(sentence, carry_len, runs)
+    local s = sentence or ""
+    if carry_len and carry_len > 0 then
+        s = s:sub(1, #s - carry_len)
+    end
+    s = s:gsub("%s+$", "") -- never trim the front: `runs` offsets anchor there
+    local needles = {}
+    local function add(n)
+        n = n:gsub("%s+$", "")
+        if n ~= "" and n ~= needles[#needles] then
+            needles[#needles + 1] = n
+        end
+    end
+    if s == "" then return needles end
+    local first_cp = Precache.utf8At(s, 1)
+    if cp_in_ruby_base(first_cp) then
+        if type(runs) == "table" and runs[1] and runs[1].start == 0
+                and type(runs[1].base) == "string" and runs[1].base ~= "" then
+            add(runs[1].base)
+        end
+    else
+        local run_end = 0
+        local i = 1
+        while i <= #s do
+            local cp, l = Precache.utf8At(s, i)
+            if cp == 0x0A or cp_in_ruby_base(cp) then break end
+            run_end = i + l - 1
+            i = i + l
+        end
+        local lead = s:sub(1, run_end)
+        add(lead)
+        for _, n_chars in ipairs({ 12, 6, 3 }) do
+            add(utf8_prefix(lead, n_chars))
+        end
+    end
+    add(utf8_prefix(s, 1))
+    return needles
+end
+
+--- Drop findText hits that landed inside a ruby annotation: kana needles
+-- match the <rt> readings too in an annotated copy, and a reading is never
+-- the sentence being read. The xpointer path names every element on the way
+-- (…/ruby/rt/text().0).
+function SentenceSplitting.filterRtHits(sel)
+    local out = {}
+    for _, hit in ipairs(sel) do
+        local xp = type(hit) == "table" and hit.start
+        if not (type(xp) == "string" and xp:match("/r[tp]c?[/%[%.]")) then
+            out[#out + 1] = hit
+        end
+    end
+    return out
 end
 
 --- Byte positions (1-based) of each sentence within the page text, found by
@@ -276,12 +381,26 @@ function Controller:pageCount()
     return ok and total or nil
 end
 
+--- The (reading-free) text of a page, memoized for the session: buildAt and
+-- the lookahead ask for the same neighbouring pages repeatedly, and in an
+-- annotated copy each miss costs a full HTML extraction + ruby strip. The
+-- cache dies with the session (reset() — any manual navigation or reflow).
 function Controller:pageText(page)
     local furigana = self:furigana()
     if not (furigana and furigana.pageText and page and page >= 1) then return nil end
     local total = self:pageCount()
     if total and page > total then return nil end
-    return furigana:pageText(page)
+    local cache = self._page_text_cache
+    if not cache then
+        cache = {}
+        self._page_text_cache = cache
+    end
+    local text = cache[page]
+    if text == nil then
+        text = furigana:pageText(page)
+        if text ~= nil then cache[page] = text end
+    end
+    return text
 end
 
 -- ------------------------------------------------------- per-step actions --
@@ -310,6 +429,47 @@ end
 
 function Controller:translateEnabled()
     return G_reader_settings:nilOrTrue("language_japanese_sentence_translate")
+end
+
+--- Whether the popup is sticky: taps and swipes outside it act on the page
+-- beneath (menus, lookups, page turns) without dismissing it; only a double
+-- tap on its left eighth (or the session ending) closes it.
+function Controller:popupSticky()
+    return G_reader_settings:nilOrTrue("language_japanese_sentence_popup_sticky")
+end
+
+--- The ruby (rt) font size for the popup, as a fraction of its base font
+-- size, honoring the reader's Ruby style tweaks for the current book:
+-- crengine's own 42% default, or whatever an enabled tweak (e.g. "Larger
+-- ruby text size", 50%) or the per-book CSS sets for rt.
+function Controller:rubyFontScale()
+    local ui = self.plugin.ui
+    local st = ui and ui.styletweak
+    -- The master "Enable style tweaks" switch gates ALL tweak css in the
+    -- book (isTweakEnabled alone ignores it) — with it off, the book
+    -- renders ruby at crengine's default and so must the popup.
+    if not (st and st.enabled) then return 0.42 end
+    local tweak_pct
+    if st.tweaks_by_id and st.isTweakEnabled then
+        for id, tweak in pairs(st.tweaks_by_id) do
+            if type(tweak) == "table" then
+                local ok, enabled = pcall(st.isTweakEnabled, st, id)
+                if ok and enabled then
+                    local found = SentenceSplitting.rubySizeFromCss(tweak.css)
+                    if found then tweak_pct = math.max(tweak_pct or 0, found) end
+                end
+            end
+        end
+    end
+    -- the per-book CSS tweak overrides the global/tweak value, like it does
+    -- in the book itself
+    local book_pct
+    local ds = ui and ui.doc_settings
+    if ds and ds.isTrue and ds:isTrue("book_style_tweak_enabled") then
+        book_pct = SentenceSplitting.rubySizeFromCss(ds:readSetting("book_style_tweak"))
+    end
+    -- 42: crengine html5.css's own `rt { font-size: 42% }`
+    return (book_pct or tweak_pct or 42) / 100
 end
 
 --- The configured double-press action for one stepping key ("none" = plain
@@ -552,10 +712,6 @@ function Controller:stepNow(dir)
         self:notify(_("Sentence splitting needs the Furigana plugin."))
         return true
     end
-    if furigana.isShowingAnnotated and furigana:isShowingAnnotated() then
-        self:notify(_("Sentence splitting works in the original book — turn 'Show furigana for current book' off first."))
-        return true
-    end
     -- While the auto reader speaks, a page key means "stop it" (like a tap).
     if furigana.autoreader and furigana.autoreader:isActive() then
         furigana.autoreader:stop(_("Auto reader stopped"))
@@ -787,13 +943,37 @@ function Controller:sentenceAnchor()
     if not (doc and doc.findText and doc.getScreenBoxesFromPositions) then return nil end
     local cur = self:curPage()
     local carry = s.idx == #s.sents and s.carry_len or 0
+    -- In the annotated furigana copy the base text is fragmented by <ruby>
+    -- nodes: use node-safe needles and ignore hits inside the readings.
+    local furigana = self:furigana()
+    local in_annotated = furigana and furigana.isShowingAnnotated
+        and furigana:isShowingAnnotated() or false
+    local needles
+    local runs -- ruby runs of the sentence (annotated copies; also sizes the box walk)
+    if in_annotated then
+        -- The ruby runs give the best needle for a kanji-led sentence; the
+        -- popup wants the same annotation right after, so the memoized
+        -- annotate() is effectively free. Skipped while the furigana display
+        -- is off (no tokenizer load for pure-cursor use) — needles then fall
+        -- back to the sentence's first character.
+        if self:showJpEnabled() and self:furiganaEnabled() then
+            local display = self:annotate(s.sents[s.idx])
+            runs = type(display) == "table" and display.runs or nil
+        end
+        needles = SentenceSplitting.anchorNeedlesAnnotated(s.sents[s.idx], carry, runs)
+    else
+        needles = SentenceSplitting.anchorNeedles(s.sents[s.idx], carry)
+    end
     local positions -- computed lazily, only when disambiguation is needed
-    for _, needle in ipairs(SentenceSplitting.anchorNeedles(s.sents[s.idx], carry)) do
+    for _, needle in ipairs(needles) do
         -- origin 0, forward: search from the top of the current page.
         -- findText never moves the view, but it does set crengine's selection
         -- highlight — clear it before anything repaints.
         local ok, sel = pcall(doc.findText, doc, needle, 0, 0, false, cur, false, 16)
         pcall(doc.clearSelection, doc)
+        if ok and type(sel) == "table" and in_annotated then
+            sel = SentenceSplitting.filterRtHits(sel)
+        end
         if ok and type(sel) == "table" and sel[1] and sel[1].start then
             local hit = sel[1]
             if #sel > 1 and s.text and s.text ~= "" then
@@ -811,12 +991,42 @@ function Controller:sentenceAnchor()
             end
             local ok_page, hit_page = pcall(doc.getPageFromXPointer, doc, hit.start)
             if ok_page and hit_page == cur then
+                -- The needle may be just the sentence's first word or
+                -- character (annotated copies especially): measure the box
+                -- over the WHOLE on-page sentence, not the needle. That way
+                -- "above" clears a leading word's furigana (a ruby BASE
+                -- hit's own box excludes the reading stacked over it — the
+                -- walk passes through the reading and the following text,
+                -- whose boxes reach the line's true top) and the below-the-
+                -- sentence fallback starts past its last line instead of
+                -- covering the sentence's remaining lines.
+                local box_end = hit["end"]
+                if doc.getNextVisibleChar then
+                    local on_page = s.sents[s.idx]
+                    if carry > 0 then
+                        on_page = on_page:sub(1, #on_page - carry)
+                    end
+                    local walk = utf8_count(on_page) - utf8_count(needle)
+                    if in_annotated then
+                        if runs then
+                            for _, r in ipairs(runs) do
+                                walk = walk + utf8_count(r.reading or "")
+                            end
+                        else
+                            walk = walk * 2 -- readings are visible chars too
+                        end
+                    end
+                    if walk > 400 then walk = 400 end
+                    for _ = 1, walk do
+                        local ok_n, nxt = pcall(doc.getNextVisibleChar, doc, box_end)
+                        if not ok_n or not nxt or nxt == box_end then break end
+                        box_end = nxt
+                    end
+                end
                 local ok_boxes, boxes = pcall(doc.getScreenBoxesFromPositions, doc,
-                    hit.start, hit["end"], true)
+                    hit.start, box_end, true)
                 if ok_boxes and type(boxes) == "table" and boxes[1] then
-                    -- The union of the line boxes: "above" clears the
-                    -- sentence's first line and the below-fallback starts
-                    -- past its last one.
+                    -- The union of the line boxes.
                     local x0, y0, x1, y1
                     for _, b in ipairs(boxes) do
                         if b.w and b.h and b.h > 0 then
@@ -827,6 +1037,16 @@ function Controller:sentenceAnchor()
                         end
                     end
                     if x0 then
+                        -- The walk may run past the page end; keep whatever
+                        -- geometry comes back inside the screen.
+                        local ok_scr, sh = pcall(function()
+                            return require("device").screen:getHeight()
+                        end)
+                        if ok_scr and type(sh) == "number" then
+                            if y0 < 0 then y0 = 0 end
+                            if y1 > sh then y1 = sh end
+                            if y1 <= y0 then y1 = y0 + 1 end
+                        end
                         local Geom = require("ui/geometry")
                         return Geom:new{ x = x0, y = y0, w = x1 - x0, h = y1 - y0 },
                             hit.start
@@ -929,6 +1149,8 @@ function Controller:present()
 
     local display
     if self:showJpEnabled() then
+        -- Memoized: in an annotated copy sentenceAnchor already annotated
+        -- this sentence for its needles.
         display = self:furiganaEnabled() and self:annotate(text) or text
     end
     s.display = display -- nil when the Japanese line is switched off
@@ -963,15 +1185,26 @@ function Controller:present()
     self:kickFetch()
 end
 
---- Splice furigana readings into `text` via the furigana plugin's cached
--- tokenizer; the bare sentence when anything is unavailable or untrustworthy.
+--- The popup display for `text`: { plain, runs } with the furigana runs from
+-- the furigana plugin's cached tokenizer (rendered as interlinear ruby by
+-- the popup); the bare sentence string when anything is unavailable or
+-- untrustworthy — the popup then shows it without readings. Memoized for the
+-- last sentence: the anchor search (annotated copies) and the popup ask for
+-- the same annotation back to back.
 function Controller:annotate(text)
+    local cached = self._annotate_cache
+    if cached and cached.text == text then return cached.display end
     local tok = self.plugin.getFuriganaTokenizer and self.plugin:getFuriganaTokenizer()
     if not tok then return text end
-    local ok, display = pcall(function()
-        return SentenceSplitting.rubyDisplay(tok:annotate(text), text)
+    local ok, runs = pcall(function()
+        return SentenceSplitting.rubyRuns(tok:annotate(text), text)
     end)
-    return (ok and display) or text
+    local display = text
+    if ok and type(runs) == "table" and #runs > 0 then
+        display = { plain = text, runs = runs }
+    end
+    self._annotate_cache = { text = text, display = display }
+    return display
 end
 
 function Controller:showPopup(display, tr)
@@ -981,22 +1214,23 @@ function Controller:showPopup(display, tr)
         UIManager:close(self.popup)
     end
     -- display may be nil (Japanese line switched off): translation-only
-    -- popups are fine, and "…" stands in while the translation is still on
-    -- its way.
-    local text
-    if display and tr then
-        text = display .. "\n" .. tr
-    else
-        text = display or tr or "…"
-    end
+    -- popups are fine, and the popup shows "…" while the translation is
+    -- still on its way.
     local popup
     popup = SentencePopup:new{
-        text = text,
+        jp = display,
+        tr = tr,
+        ruby_scale = self:rubyFontScale(),
+        sticky = self:popupSticky(),
+        reader_ui = self.plugin.ui, -- unconsumed input acts on the reader
         anchor_box = self.session and self.session.anchor or nil,
         next_seq = self:seqFor(1),
         prev_seq = self:seqFor(-1),
         on_step = function(dir) self:onStep(dir) end,
-        on_frame_tap = function() self:onPopupTap() end,
+        on_frame_tap = function(left) self:onPopupTap(left) end,
+        on_word_lookup = function(plain, start_byte, sel_text, is_single)
+            self:lookupWord(plain, start_byte, sel_text, is_single)
+        end,
         on_text_select = function(sel_text) self:lookupSelection(sel_text) end,
         close_callback = function()
             if self.popup == popup then self.popup = nil end
@@ -1008,8 +1242,8 @@ function Controller:showPopup(display, tr)
     UIManager:show(popup)
 end
 
---- Text selected (hold + drag) inside the popup: look it up in the
--- dictionary, like selecting text in the dictionary window itself does.
+--- Text selected (hold + drag) inside the popup's translation line: look it
+-- up in the dictionary, like selecting text in the dictionary window does.
 function Controller:lookupSelection(text)
     if type(text) ~= "string" or text == "" then return end
     local ui = self.plugin.ui
@@ -1018,6 +1252,82 @@ function Controller:lookupSelection(text)
         return require("util").cleanupSelectedText(text)
     end)
     ui.dictionary:onLookupWord(ok and cleaned or text, true)
+end
+
+--- A hold on the popup's Japanese line: look up the word at that position
+-- exactly like a hold on the book page — grow the selection from the held
+-- character with the Yomichan forward scan (deinflect every prefix, one
+-- batched sdcv call, keep the longest surface your dictionaries know), then
+-- a normal dictionary lookup (which adds the deinflected candidates itself).
+-- The scan runs on the PLAIN sentence, so furigana readings never leak into
+-- the query. A dragged (multi-atom) selection is looked up as selected.
+function Controller:lookupWord(plain, start_byte, sel_text, is_single)
+    local ui = self.plugin.ui
+    if not (ui and ui.dictionary and ui.dictionary.onLookupWord) then return end
+    local word
+    if is_single and type(plain) == "string" then
+        local ok, expanded = pcall(self.expandAt, self, plain, start_byte)
+        if ok then word = expanded end
+    end
+    if not word or word == "" then
+        local ok, cleaned = pcall(function()
+            return require("util").cleanupSelectedText(sel_text)
+        end)
+        word = (ok and cleaned) or sel_text
+    end
+    if type(word) ~= "string" or word == "" then return end
+    -- is_sane=false, like the book-page path: punctuation is stripped there.
+    ui.dictionary:onLookupWord(word, false)
+end
+
+--- Yomichan-style expansion on a plain string: from the character at 0-based
+-- byte offset `off`, try every candidate surface of 2..max_scan_length
+-- characters (stopping at punctuation), deinflect each, and keep the longest
+-- one with a dictionary hit — the same scan japanese.koplugin's
+-- onWordSelection runs through crengine callbacks on the book page. Returns
+-- nil when nothing matched (the caller falls back to the held atom's text).
+function Controller:expandAt(plain, off)
+    local p = self.plugin
+    local deinflector = p.deinflector
+    local dictionary = p.dictionary
+    if not (deinflector and dictionary and dictionary.rawSdcv) then return nil end
+    local max_scan = p.max_scan_length or 20
+    -- byte offsets of the word characters from the held one on (plus an end
+    -- sentinel), stopping at anything that cannot be part of a word
+    local offs = {}
+    local i = off + 1
+    while i <= #plain and #offs < max_scan + 2 do
+        local cp, len = Precache.utf8At(plain, i)
+        if not Precache.isWordCp(cp) then break end
+        offs[#offs + 1] = i
+        i = i + len
+    end
+    offs[#offs + 1] = i -- end sentinel
+    if #offs < 3 then return nil end -- not even a two-character candidate
+    local all_terms, all_surfaces = {}, {}
+    for clen = 2, #offs - 1 do
+        local surface = plain:sub(off + 1, offs[clen + 1] - 1)
+        local ok, cands = pcall(deinflector.deinflect, deinflector, surface)
+        if ok and type(cands) == "table" then
+            for _, c in ipairs(cands) do
+                if c.term and c.term ~= "" then
+                    all_terms[#all_terms + 1] = c.term
+                    all_surfaces[#all_surfaces + 1] = surface
+                end
+            end
+        end
+    end
+    if #all_terms == 0 then return nil end
+    local best
+    local ok, cancelled, results = pcall(dictionary.rawSdcv, dictionary, all_terms)
+    if ok and not cancelled and type(results) == "table" then
+        for ri, term_results in ipairs(results) do
+            if type(term_results) == "table" and #term_results > 0 then
+                best = all_surfaces[ri] -- candidates are shortest-first: keep the longest hit
+            end
+        end
+    end
+    return best
 end
 
 function Controller:play(wav)
@@ -1032,16 +1342,28 @@ function Controller:play(wav)
     end
 end
 
---- Every tap on the popup body lands here; a second one within the window
--- makes it a double tap. Single tap = show/hide the translation, double tap
--- = replay the audio.
-function Controller:onPopupTap()
+--- Every tap on the popup body lands here (`left` = on the bubble's left
+-- eighth); a second one within the window makes it a double tap. Single tap
+-- = show/hide the translation, double tap = replay the audio — except both
+-- taps on the left eighth, which dismisses the bubble (the way out while it
+-- is sticky; the session keeps running, a step or the double-press "popup"
+-- action brings it back).
+function Controller:onPopupTap(left)
     local UIManager = require("ui/uimanager")
     if self._tap_pending then
+        local first_left = self._tap_left
         self:cancelPendingTap()
-        self:replay()
+        if left and first_left then
+            if self.popup then
+                UIManager:close(self.popup)
+                self.popup = nil
+            end
+        else
+            self:replay()
+        end
     else
         self._tap_pending = true
+        self._tap_left = left or false
         UIManager:unschedule(self._tap_timeout_fn)
         UIManager:scheduleIn(SentenceSplitting.DOUBLE_TAP_S, self._tap_timeout_fn)
     end
@@ -1389,6 +1711,8 @@ function Controller:reset()
     self:cancelPendingStep()
     self:clearMarker()
     self.session = nil
+    self._page_text_cache = nil -- pages may reflow while we're away
+    self._annotate_cache = nil
     for _, lane in ipairs({ "fetch_wav", "fetch_tr" }) do
         local f = self[lane]
         if f then

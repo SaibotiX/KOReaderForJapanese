@@ -258,6 +258,90 @@ function M.strip_ruby(markup)
     return table.concat(out)
 end
 
+-- Tags that visually break the text flow: their boundaries become newlines
+-- when flattening markup to plain text. Includes crengine's internal block
+-- wrappers (DocFragment, autoBoxing…), which its getHTMLFromXPointers output
+-- can contain.
+local BLOCK_TAGS = {
+    p = true, br = true, div = true, li = true, ul = true, ol = true,
+    dl = true, dt = true, dd = true, td = true, th = true, tr = true,
+    table = true, h1 = true, h2 = true, h3 = true, h4 = true, h5 = true,
+    h6 = true, blockquote = true, hr = true, section = true, article = true,
+    aside = true, main = true, header = true, footer = true, figure = true,
+    figcaption = true, pre = true, body = true, html = true,
+    docfragment = true, autoboxing = true, floatbox = true, tabularbox = true,
+}
+
+local function utf8_char(cp)
+    if not cp or cp < 0 or cp > 0x10FFFF then return "" end
+    if cp < 0x80 then return string.char(cp) end
+    if cp < 0x800 then
+        return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
+    end
+    if cp < 0x10000 then
+        return string.char(0xE0 + math.floor(cp / 0x1000),
+            0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+    end
+    return string.char(0xF0 + math.floor(cp / 0x40000),
+        0x80 + math.floor(cp / 0x1000) % 0x40,
+        0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+end
+
+--- Flatten markup (e.g. crengine's getHTMLFromXPointers output) to the plain
+-- text a reader would see: tags dropped, block-level boundaries and <br>
+-- becoming newlines, <script>/<style>/<head> contents skipped, numeric and
+-- common named entities decoded, soft hyphens removed, ASCII whitespace
+-- tidied (ideographic spaces — paragraph indents — are kept). Run strip_ruby
+-- first when the markup may carry furigana: this keeps every text node,
+-- readings included.
+function M.html_to_text(markup)
+    local out, on = {}, 0
+    local skip_depth = 0
+    local i, len = 1, #markup
+    local function emit(s)
+        if skip_depth == 0 and s ~= "" then on = on + 1; out[on] = s end
+    end
+    while i <= len do
+        local lt = markup:find("<", i, true)
+        if not lt then
+            emit(markup:sub(i)); break
+        end
+        if lt > i then emit(markup:sub(i, lt - 1)) end
+        local gt = markup:find(">", lt + 1, true)
+        if not gt then
+            emit(markup:sub(lt)); break
+        end
+        local tag = markup:sub(lt, gt)
+        local slash, name = tag:match("^<%s*(/?)%s*([%a][%w_:%-]*)")
+        if name then
+            name = name:lower()
+            if SKIP_TAGS[name] and tag:sub(-2) ~= "/>" then
+                if slash == "/" then
+                    skip_depth = skip_depth > 0 and skip_depth - 1 or 0
+                else
+                    skip_depth = skip_depth + 1
+                end
+            elseif BLOCK_TAGS[name] and skip_depth == 0 then
+                on = on + 1; out[on] = "\n"
+            end
+        end
+        i = gt + 1
+    end
+    local text = table.concat(out)
+    -- entities: numeric first, &amp; last (so "&amp;lt;" stays literal)
+    text = text:gsub("&#[xX](%x+);", function(h) return utf8_char(tonumber(h, 16)) end)
+    text = text:gsub("&#(%d+);", function(d) return utf8_char(tonumber(d)) end)
+    text = text:gsub("&nbsp;", " "):gsub("&lt;", "<"):gsub("&gt;", ">")
+               :gsub("&quot;", '"'):gsub("&apos;", "'"):gsub("&amp;", "&")
+    text = text:gsub("\194\173", "") -- soft hyphens (crengine may hyphenate)
+    text = text:gsub("\r", "")
+    text = text:gsub("[ \t]+", " ")
+    text = text:gsub(" ?\n ?", "\n")
+    text = text:gsub("\n+", "\n")
+    text = text:gsub("^[%s]+", ""):gsub("[%s]+$", "")
+    return text
+end
+
 -- Best-effort charset sniff from a document head. Returns a lowercased charset
 -- name, or nil if undeclared (caller then assumes UTF-8). Our tokenizer works on
 -- UTF-8 bytes, so a non-UTF-8 standalone HTML (Shift-JIS, EUC-JP…) is refused.

@@ -146,6 +146,37 @@ sents = AutoReader.splitSentences("「あいさつ。」")
 check(#sents == 1 and sents[1] == "「あいさつ。」",
     "a quote that is the whole sentence stays one unit: " .. table.concat(sents, "|"))
 
+-- Closed quotes as complete sentences (the page-boundary merge fix): a
+-- terminator-closed quote ends the sentence before another opening quote, a
+-- newline, or the end of the text — but never before continuing narration.
+local _, closed_incomplete = AutoReader.splitSentences("「あいさつ。」")
+check(closed_incomplete == false,
+    "a terminator-closed quote ending the text is complete (no page carry)")
+
+local _, bare_incomplete = AutoReader.splitSentences("「あいさつ」")
+check(bare_incomplete == false,
+    "a closed quote ending the text is complete even without 。 before 」")
+
+sents = AutoReader.splitSentences("「文一。」「文二。」")
+check(#sents == 2 and sents[1] == "「文一。」" and sents[2] == "「文二。」",
+    "back-to-back terminator-closed quotes split apart: " .. table.concat(sents, "|"))
+
+sents = AutoReader.splitSentences("「あ。」　「い。」")
+check(#sents == 2 and sents[1] == "「あ。」" and sents[2] == "「い。」",
+    "an ideographic space between closed quotes is looked through: " .. table.concat(sents, "|"))
+
+sents = AutoReader.splitSentences("彼の言う「自由」「平等」は建前だ。")
+check(#sents == 1 and sents[1] == "彼の言う「自由」「平等」は建前だ。",
+    "quotes without an inner terminator never split mid-sentence: " .. table.concat(sents, "|"))
+
+sents = AutoReader.splitSentences("「外だ。『中よ。』」「次。」")
+check(#sents == 2 and sents[1] == "「外だ。『中よ。』」" and sents[2] == "「次。」",
+    "piled-up closers scan back to the terminator: " .. table.concat(sents, "|"))
+
+sents = AutoReader.splitSentences("「そうだ」と言った。")
+check(#sents == 1 and sents[1] == "「そうだ」と言った。",
+    "a terminator-less quote before narration keeps the sentence whole: " .. table.concat(sents, "|"))
+
 local q_sents, q_incomplete = AutoReader.splitSentences("「開いたまま\n次の段落。")
 check(#q_sents == 2 and q_sents[1] == "「開いたまま" and q_sents[2] == "次の段落。"
         and not q_incomplete,
@@ -241,6 +272,20 @@ check(AutoReader.sentenceHead("まだまだ続く", 6) == nil,
 head = AutoReader.sentenceHead("元気？」と言った。続き。", nil, 1)
 check(head == "元気？」と言った。",
     "sentenceHead honors carried-in quote depth: " .. tostring(head))
+head, consumed = AutoReader.sentenceHead("そうだ。」「おい。」と続けた。", nil, 1)
+check(head == "そうだ。」" and consumed == #"そうだ。」",
+    "a carried quote completed by 。」 stops before the next quote: " .. tostring(head))
+head = AutoReader.sentenceHead("」と言った。次。", nil, 1)
+check(head == "」と言った。",
+    "a bare leading closer keeps scanning (its terminator sat on the previous page): "
+        .. tostring(head))
+head, consumed = AutoReader.sentenceHead("逃げろ」", nil, 1)
+check(head == "逃げろ」" and consumed == #"逃げろ」",
+    "a carried quote closing bare at the very end of the text completes there: "
+        .. tostring(head))
+head = AutoReader.sentenceHead("逃げろ」と続く", nil, 1)
+check(head == nil,
+    "…but not when text continues after the bare closer (no sentence end yet)")
 head = AutoReader.sentenceHead("元気？」と言った。続き。", nil, 0)
 check(head == "元気？」",
     "…without carried depth the same head ends right after the closer: "
@@ -390,12 +435,14 @@ check(fail_msg, "the user is told synthesis failed")
 fetch_results = nil
 pages = { [1] = "今日はいい天気。明日は", [2] = "雨になる。終わり。" }
 
--- Annotated copies are refused (their text interleaves the readings).
+-- Annotated copies work too now: the plugin's pageText strips the readings,
+-- so start() no longer refuses them.
 plugin.isShowingAnnotated = function() return true end
 shown = {}
 controller:start()
-check(controller:isActive() == false and #shown == 1 and shown[1].text:match("original book"),
-    "annotated copy: refuses to start with an explanation")
+check(controller:isActive() == true,
+    "annotated copy: the auto reader starts (pageText is reading-free)")
+controller:stop()
 plugin.isShowingAnnotated = function() return false end
 
 os.execute("rm -rf '" .. root .. "'")

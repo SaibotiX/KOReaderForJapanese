@@ -83,6 +83,19 @@ local find_hit_page = nil -- page of the hit (nil: the current page)
 
 local popups = {} -- every SentencePopup the controller created
 
+-- The popup receives structured jp ({ plain, runs } or a plain string) + tr;
+-- flatten to the old combined text for compact asserts: readings back in
+-- parentheses, translation on the second line, "…" when both are missing.
+local function popup_text(o)
+    local jp = o.jp
+    if type(jp) == "table" then
+        local ReadingExtractor = require("readingextractor")
+        jp = ReadingExtractor.display(jp.plain, jp.runs, 0, #jp.plain) or jp.plain
+    end
+    if jp and o.tr then return jp .. "\n" .. o.tr end
+    return jp or o.tr or "…"
+end
+
 local subprocess_pid = 100
 local stubs = {
     ["ui/uimanager"] = UIManager,
@@ -207,14 +220,54 @@ check(#q_sents == 1 and q_sents[1] == "彼は「もう帰る。また明日。�
 check(SS.computeSkip(q1, q2) == #"また明日。」と言った。",
     "computeSkip carries the quote depth into the next page's head")
 
--- ---------------------------------------------------------- rubyDisplay --
+-- The complementary case (regression): a page ending in a CLOSED quote is a
+-- complete sentence. It used to count as incomplete (its terminator sits
+-- inside the brackets), so the NEXT page's first quote was glued onto it:
+-- 「文一。」+「文二。」 became one block.
+local c1 = "彼は言った。「文一。」"
+local c2 = "「文二。」\nそれから帰った。"
+local c_sents, c_consumed = SS.buildPage(c1, c2, 0)
+check(#c_sents == 2 and c_sents[2] == "「文一。」" and c_consumed == 0,
+    "a page ending in a closed quote does not swallow the next page's quote: "
+        .. table.concat(c_sents, "|"))
+check(SS.computeSkip(c1, c2) == 0,
+    "computeSkip carries nothing over a closed-quote page end")
+local c2_sents = SS.buildPage(c2, "", 0)
+check(#c2_sents == 2 and c2_sents[1] == "「文二。」",
+    "the next page keeps its own dialogue line: " .. table.concat(c2_sents, "|"))
 
-check(SS.rubyDisplay("<ruby>漢字<rt>かんじ</rt></ruby>を書く。", "漢字を書く。")
-    == "漢字（かんじ）を書く。", "rubyDisplay splices readings into the sentence")
-check(SS.rubyDisplay("ひらがなだけ。", "ひらがなだけ。") == "ひらがなだけ。",
-    "rubyDisplay returns kana-only sentences unchanged")
-check(SS.rubyDisplay("<ruby>違<rt>ちが</rt></ruby>う", "別のテキスト") == nil,
-    "rubyDisplay refuses a round-trip mismatch")
+-- Same with the 。 omitted before 」 (common in fiction).
+local b_sents, b_consumed = SS.buildPage("彼は言った。「文一」", "「文二」\n続き。", 0)
+check(#b_sents == 2 and b_sents[2] == "「文一」" and b_consumed == 0,
+    "a terminator-less closed quote at the page end stays its own sentence: "
+        .. table.concat(b_sents, "|"))
+
+-- ------------------------------------------------------------- rubyRuns --
+
+local rr = SS.rubyRuns("<ruby>漢字<rt>かんじ</rt></ruby>を書く。", "漢字を書く。")
+check(type(rr) == "table" and #rr == 1 and rr[1].base == "漢字"
+    and rr[1].reading == "かんじ" and rr[1].start == 0 and rr[1].len == #"漢字",
+    "rubyRuns maps the tokenizer's ruby back to plain-text offsets")
+rr = SS.rubyRuns("ひらがなだけ。", "ひらがなだけ。")
+check(type(rr) == "table" and #rr == 0,
+    "rubyRuns returns empty runs for kana-only sentences")
+check(SS.rubyRuns("<ruby>違<rt>ちが</rt></ruby>う", "別のテキスト") == nil,
+    "rubyRuns refuses a round-trip mismatch")
+
+-- -------------------------------------------------------- rubySizeFromCss --
+
+check(SS.rubySizeFromCss("rt, rubyBox[T=rt] { font-size: 50% !important; }") == 50,
+    "rubySizeFromCss reads the Ruby style tweak's rt size")
+check(SS.rubySizeFromCss("p, li { font-size: 60%; }") == nil,
+    "rubySizeFromCss ignores css that does not target rt")
+check(SS.rubySizeFromCss("rt { color: gray; }") == nil,
+    "rubySizeFromCss ignores rt rules without a font-size")
+check(SS.rubySizeFromCss("article { font-size: 80%; } rt { font-size: 45% }") == 45,
+    "rubySizeFromCss is not fooled by selectors merely containing 'rt'")
+check(SS.rubySizeFromCss("rt { font-size: 87.5% }") == 87.5,
+    "rubySizeFromCss reads decimal percentages whole (not the trailing '5%')")
+check(SS.rubySizeFromCss("rt { font-size: 0.6em }") == 60,
+    "rubySizeFromCss understands em units")
 
 -- ------------------------------------------------------------- controller --
 
@@ -311,8 +364,15 @@ end
 
 -- first press: first sentence of the current page (furigana on by default)
 check(ctrl:onKeyPress(fake_key("LPgFwd")) == true, "a hijacked key press is consumed")
-check(#popups == 1 and popups[1].text == "今日は晴（は）れ。",
+check(#popups == 1 and popup_text(popups[1]) == "今日は晴（は）れ。",
     "first press shows the page's first sentence with furigana spliced in")
+check(type(popups[1].jp) == "table" and popups[1].jp.plain == "今日は晴れ。"
+        and popups[1].jp.runs[1].base == "晴" and popups[1].jp.runs[1].reading == "は"
+        and popups[1].jp.runs[1].start == #"今日は",
+    "the popup receives the plain sentence plus its ruby runs (interlinear display)")
+check(popups[1].sticky == true, "the popup is sticky by default")
+check(popups[1].ruby_scale == 0.42,
+    "without Ruby style tweaks the popup uses crengine's 42% rt size")
 local a = popups[1].anchor_box
 check(a ~= nil and a.x == 100 and a.y == 400 and a.w == 300 and a.h == 60,
     "the popup is anchored to the union of the sentence's line boxes")
@@ -323,9 +383,9 @@ check(ctrl:onKeyPress(fake_key("Home")) == nil, "unrelated keys are not consumed
 pump()
 check(played[1] ~= nil and played[1]:match("%.wav$") ~= nil,
     "the first sentence's audio was synthesized and played")
-check(#popups >= 2 and popups[#popups].text:find("EN:今日は晴れ。", 1, true) ~= nil,
+check(#popups >= 2 and popup_text(popups[#popups]):find("EN:今日は晴れ。", 1, true) ~= nil,
     "the translation is swapped into the popup when it lands")
-check(popups[#popups].text:find("晴（は）れ", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("晴（は）れ", 1, true) ~= nil,
     "the swapped popup keeps the furigana display")
 check(popups[#popups].anchor_box ~= nil and popups[#popups].anchor_box.y == 400,
     "the translation swap keeps the sentence anchor")
@@ -349,8 +409,8 @@ check(fg_locks[1] == true and fg_locks[#fg_locks] == false,
 local played_before = #played
 local fetches_before = #fetched_texts
 ctrl:onKeyPress(fake_key("LPgFwd"))
-check(popups[#popups].text:find("明日は雨が降るかもしれない。", 1, true) ~= nil
-    and popups[#popups].text:find("EN:明日は", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("明日は雨が降るかもしれない。", 1, true) ~= nil
+    and popup_text(popups[#popups]):find("EN:明日は", 1, true) ~= nil,
     "second press shows sentence 2 with its cached translation at once")
 check(find_calls[#find_calls] == "明日は雨が降るかも",
     "a page-spanning sentence is located by its on-page part only")
@@ -364,18 +424,18 @@ played_before = #played
 popups[#popups].on_frame_tap()
 pump() -- the double-tap window elapses: it was a single tap
 check(#played == played_before and #popups == pops_before + 1
-    and popups[#popups].text:find("EN:", 1, true) == nil
-    and popups[#popups].text:find("明日は雨が降るかも", 1, true) ~= nil,
+    and popup_text(popups[#popups]):find("EN:", 1, true) == nil
+    and popup_text(popups[#popups]):find("明日は雨が降るかも", 1, true) ~= nil,
     "a single tap hides the translation line without replaying")
 popups[#popups].on_frame_tap()
 popups[#popups].on_frame_tap() -- second tap within the window
 pump()
 check(#played == played_before + 1, "a double tap replays the audio")
-check(popups[#popups].text:find("EN:", 1, true) == nil,
+check(popup_text(popups[#popups]):find("EN:", 1, true) == nil,
     "a double tap does not toggle the translation")
 popups[#popups].on_frame_tap()
 pump()
-check(popups[#popups].text:find("EN:明日は", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("EN:明日は", 1, true) ~= nil,
     "a further single tap reveals the cached translation again")
 
 -- third press: past the page's last sentence -> page flip, carry skipped
@@ -383,7 +443,7 @@ ctrl:onKeyPress(fake_key("LPgFwd"))
 check(current_page == 2, "stepping past the last sentence turns the page")
 check(ctrl.session ~= nil and ctrl.session.page == 2 and ctrl.session.idx == 1,
     "the session moved to the new page (self-caused flip kept it)")
-check(popups[#popups].text:find("次の文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("次の文。", 1, true) ~= nil,
     "the carried-over bytes are skipped: page 2 starts at its own sentence")
 pump()
 
@@ -391,7 +451,7 @@ pump()
 ctrl:onKeyPress(fake_key("LPgBack"))
 check(current_page == 1, "stepping back before the first sentence turns back")
 check(ctrl.session.idx == 2
-    and popups[#popups].text:find("明日は雨が降るかも", 1, true) ~= nil,
+    and popup_text(popups[#popups]):find("明日は雨が降るかも", 1, true) ~= nil,
     "landing on the previous page's last sentence")
 pump()
 
@@ -401,7 +461,7 @@ plugin:onPageUpdate(3)
 check(ctrl.session == nil, "manual navigation drops the session")
 ctrl:onKeyPress(fake_key("LPgFwd"))
 check(ctrl.session ~= nil and ctrl.session.page == 3
-    and popups[#popups].text:find("三ページ目の文。", 1, true) ~= nil,
+    and popup_text(popups[#popups]):find("三ページ目の文。", 1, true) ~= nil,
     "the next press starts fresh on the new page")
 pump()
 
@@ -445,7 +505,7 @@ ctrl:reset()
 local tr_before = #tr_calls
 ctrl:onKeyPress(fake_key("LPgFwd"))
 pump()
-check(popups[#popups].text:find("EN:", 1, true) == nil,
+check(popup_text(popups[#popups]):find("EN:", 1, true) == nil,
     "translation toggle off: the popup shows no translation line")
 check(#tr_calls == tr_before, "translation toggle off: no translation is fetched")
 infos = {}
@@ -480,7 +540,7 @@ for _, t in ipairs(infos) do
     if t:find("No network", 1, true) then offline_notes = offline_notes + 1 end
 end
 check(offline_notes == 1
-    and popups[#popups].text:find("EN:", 1, true) ~= nil,
+    and popup_text(popups[#popups]):find("EN:", 1, true) ~= nil,
     "offline: cached translations still show, without renewed nagging")
 net.online = true
 
@@ -503,12 +563,12 @@ tr_fail = false
 current_page = 1
 plugin:onPageUpdate(1)
 ctrl:onKeyPress(fake_key("LPgFwd"))
-check(popups[#popups].text:find("EN:今日は晴れ。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("EN:今日は晴れ。", 1, true) ~= nil,
     "translation is visible again on a fresh sentence (from cache)")
 popups[#popups].on_frame_tap()
 pump()
 ctrl:onKeyPress(fake_key("LPgFwd"))
-check(popups[#popups].text:find("EN:", 1, true) == nil,
+check(popup_text(popups[#popups]):find("EN:", 1, true) == nil,
     "the hidden choice persists to the following sentence")
 pump()
 
@@ -523,6 +583,34 @@ check(#SS.anchorNeedles("あ", 0) == 1 and SS.anchorNeedles("あ", 0)[1] == "あ
     "anchorNeedles: a short sentence yields just itself")
 check(SS.anchorNeedles("ページ跨ぎの文です続き", #"続き")[1] == "ページ跨ぎの文です",
     "anchorNeedles: the carried-over completion is trimmed first")
+
+-- Annotated-copy needles: node-safe pieces only (crengine text search cannot
+-- cross the text-node boundaries <ruby> introduces around kanji).
+local an = SS.anchorNeedlesAnnotated("そして学校へ行った。", 0)
+check(an[1] == "そして" and an[#an] == "そ",
+    "annotated needles: the leading kana run, then the first character: "
+        .. table.concat(an, "|"))
+an = SS.anchorNeedlesAnnotated("学校へ行った。", 0,
+    { { start = 0, len = #"学校", base = "学校", reading = "がっこう" } })
+check(an[1] == "学校" and an[#an] == "学",
+    "annotated needles: a kanji-led sentence uses its first run's base text: "
+        .. table.concat(an, "|"))
+an = SS.anchorNeedlesAnnotated("学校へ行った。", 0, nil)
+check(#an == 1 and an[1] == "学",
+    "annotated needles: without runs a kanji-led sentence falls to its first char")
+an = SS.anchorNeedlesAnnotated("そして学校へ行った跡が続く", #"跡が続く")
+check(an[1] == "そして", "annotated needles: the carried completion is trimmed first")
+
+local rt_sel = {
+    { start = "/body/p[1]/ruby[2]/rt/text().0" },
+    { start = "/body/p[1]/ruby[2]/text().0" },
+    { start = "/body/p[2]/text().4" },
+    { start = "/body/p[3]/ruby/rtc/rt/text().1" },
+}
+local kept = SS.filterRtHits(rt_sel)
+check(#kept == 2 and kept[1].start == "/body/p[1]/ruby[2]/text().0"
+        and kept[2].start == "/body/p[2]/text().4",
+    "filterRtHits drops hits inside rt/rtc readings, keeps base-text hits")
 
 local ptext = "犬。猫。犬。"
 local psents = { "犬。", "猫。", "犬。" }
@@ -610,6 +698,66 @@ pump()
 doc.findText = orig_findText
 doc.getScreenBoxesFromPositions = orig_boxes
 
+-- ====================== annotated furigana copy ===========================
+-- pageText (stubbed here; the real one strips the ruby readings) is already
+-- plain: stepping must work — the old guard refused annotated copies — and
+-- the anchor search must use node-safe needles and skip hits inside <rt>.
+
+ui.furigana.isShowingAnnotated = function() return true end
+pages[1] = "今日は晴れ。明日も晴れ。"
+current_page = 1
+ctrl:stop()
+find_calls = {}
+local box_ranges = {}
+local prev_boxes_fn = doc.getScreenBoxesFromPositions
+doc.getScreenBoxesFromPositions = function(_, s0, s1)
+    box_ranges[#box_ranges + 1] = { s0, s1 }
+    return { { x = 100, y = 400, w = 300, h = 30 } }
+end
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(ctrl.session ~= nil and ctrl.session.idx == 1 and ctrl.popup ~= nil,
+    "annotated copy: stepping works (the original-book guard is gone)")
+-- 今日は晴れ。 starts with the kanji 今; the fake tokenizer only annotates
+-- 晴れ (a run that does not start the sentence), so the node-safe ladder is
+-- just the first character.
+check(find_calls[1] == "今",
+    "annotated copy: the anchor search used a node-safe needle: "
+        .. tostring(find_calls[1]))
+-- The measured box extends from the 1-char needle to the sentence's end:
+-- 5 more base characters plus the は reading = 6 visible-char steps, so the
+-- popup clears the furigana above a leading kanji and never sits on the
+-- sentence's remaining lines.
+check(box_ranges[1] ~= nil
+        and box_ranges[1][2] == "xp_hit_end" .. string.rep("+", 6),
+    "annotated copy: the anchor box covers the whole sentence, readings included: "
+        .. tostring(box_ranges[1] and box_ranges[1][2]))
+pump()
+
+-- A needle that first matches inside a reading: the rt hit is skipped and
+-- the base-text hit anchors (without the filter the rt hit — on "page 99" —
+-- would be rejected and the popup would fall to the bottom).
+local orig_page_from_xp = doc.getPageFromXPointer
+doc.findText = function(_, pattern)
+    find_calls[#find_calls + 1] = pattern
+    return {
+        { start = "/body/p/ruby/rt/text().0", ["end"] = "xp_rt_end" },
+        { start = "/body/p/text().2", ["end"] = "xp_base_end" },
+    }, 2
+end
+doc.getPageFromXPointer = function(_, xp)
+    return (type(xp) == "string" and xp:find("/rt/", 1, true)) and 99 or current_page
+end
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(popups[#popups].anchor_box ~= nil,
+    "annotated copy: hits inside <rt> readings are skipped, base text anchors")
+pump()
+doc.findText = orig_findText
+doc.getPageFromXPointer = orig_page_from_xp
+doc.getScreenBoxesFromPositions = prev_boxes_fn
+ui.furigana.isShowingAnnotated = function() return false end
+ctrl:stop()
+
 -- ======================= per-step action toggles ==========================
 
 ctrl.tr_visible = true -- earlier scenarios hid the translation line
@@ -626,7 +774,7 @@ ctrl:onKeyPress(fake_key("LPgFwd"))
 pump(500)
 check(#fetched_texts == fetches_b4 and #played == played_before,
     "audio toggled off: nothing is synthesized or played on step")
-check(popups[#popups].text:find("音声なしの文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("音声なしの文。", 1, true) ~= nil,
     "…while the popup still shows")
 popups[#popups].on_frame_tap()
 popups[#popups].on_frame_tap()
@@ -641,10 +789,10 @@ pages[3] = "日本語非表示の文。"
 current_page = 3
 ctrl:stop()
 ctrl:onKeyPress(fake_key("LPgFwd"))
-check(popups[#popups].text == "…",
+check(popup_text(popups[#popups]) == "…",
     "JP line off: a placeholder holds the popup until the translation lands")
 pump(500)
-check(popups[#popups].text == "EN:日本語非表示の文。",
+check(popup_text(popups[#popups]) == "EN:日本語非表示の文。",
     "JP line off: only the translation appears in the popup")
 settings.language_japanese_sentence_show_jp = nil
 
@@ -693,7 +841,7 @@ pump(500)
 check(#popups == pops_b4, "…and the held step never runs")
 ctrl:onKeyPress(fake_key("LPgFwd"))
 pump(500) -- the double-press window elapses
-check(#popups > pops_b4 and popups[#popups].text:find("甲の文。", 1, true) ~= nil,
+check(#popups > pops_b4 and popup_text(popups[#popups]):find("甲の文。", 1, true) ~= nil,
     "a lone press steps once the window passes")
 pops_b4 = #popups
 ctrl:onKeyPress(fake_key("LPgFwd"))
@@ -718,7 +866,7 @@ current_page = 3
 ctrl:stop()
 ctrl:onKeyPress(fake_key("LPgFwd"))
 pump(500) -- held (next key has an action), steps after the window
-check(popups[#popups].text:find("個別キーの文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("個別キーの文。", 1, true) ~= nil,
     "per-key: the action key steps after its window")
 pops_b4 = #popups
 played_before = #played
@@ -740,20 +888,20 @@ pages[1] = page1
 current_page = 1
 ctrl:stop()
 ctrl:onKeyPress(fake_key("LPgFwd")) -- next key plain: steps instantly
-check(popups[#popups].text:find("晴（は）れ", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("晴（は）れ", 1, true) ~= nil,
     "furigana action: the sentence starts with readings on")
 ctrl:onKeyPress(fake_key("LPgBack"))
 ctrl:onKeyPress(fake_key("LPgBack"))
 pump(500)
 check(settings.language_japanese_sentence_furigana == false
-        and popups[#popups].text:find("晴（は）れ", 1, true) == nil
-        and popups[#popups].text:find("今日は晴れ。", 1, true) ~= nil,
+        and popup_text(popups[#popups]):find("晴（は）れ", 1, true) == nil
+        and popup_text(popups[#popups]):find("今日は晴れ。", 1, true) ~= nil,
     "double press flips the furigana off and refreshes the shown popup")
 ctrl:onKeyPress(fake_key("LPgBack"))
 ctrl:onKeyPress(fake_key("LPgBack"))
 pump(500)
 check(settings.language_japanese_sentence_furigana == nil
-        and popups[#popups].text:find("晴（は）れ", 1, true) ~= nil,
+        and popup_text(popups[#popups]):find("晴（は）れ", 1, true) ~= nil,
     "a further double press brings the readings back")
 settings.language_japanese_sentence_doublepress_prev = nil
 
@@ -770,10 +918,10 @@ check(ctrl.popup == nil, "per-step popup off: stepping shows no bubble")
 ctrl:onKeyPress(fake_key("LPgFwd"))
 ctrl:onKeyPress(fake_key("LPgFwd"))
 check(ctrl.popup ~= nil and #popups == pops_b4 + 1
-        and popups[#popups].text:find("要求ポップアップの文。", 1, true) ~= nil,
+        and popup_text(popups[#popups]):find("要求ポップアップの文。", 1, true) ~= nil,
     "double press summons the current sentence's popup on demand")
 pump(500)
-check(popups[#popups].text:find("EN:要求ポップアップの文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("EN:要求ポップアップの文。", 1, true) ~= nil,
     "…and its translation is fetched and swapped in even in cursor mode")
 ctrl:onKeyPress(fake_key("LPgFwd"))
 ctrl:onKeyPress(fake_key("LPgFwd"))
@@ -789,7 +937,7 @@ current_page = 1
 ctrl:stop()
 ctrl:startAt(#"一文目。" + 2) -- a byte inside the second sentence
 check(ctrl.session ~= nil and ctrl.session.idx == 2
-    and popups[#popups].text:find("二文目。", 1, true) ~= nil,
+    and popup_text(popups[#popups]):find("二文目。", 1, true) ~= nil,
     "startAt lands on the sentence containing the byte offset")
 pump()
 
@@ -797,11 +945,125 @@ pump()
 
 local dict_lookups = {}
 ui.dictionary = {
-    onLookupWord = function(_, word) dict_lookups[#dict_lookups + 1] = word end,
+    onLookupWord = function(_, word, is_sane)
+        dict_lookups[#dict_lookups + 1] = { word = word, is_sane = is_sane }
+    end,
 }
 popups[#popups].on_text_select("  二文目 ")
-check(dict_lookups[1] == "二文目",
-    "text selected on the popup is cleaned and looked up in the dictionary")
+check(dict_lookups[1] ~= nil and dict_lookups[1].word == "二文目",
+    "text selected on the popup's translation line is cleaned and looked up")
+
+-- ============ hold on the Japanese line: page-equivalent lookup ===========
+-- A single hold runs the Yomichan expansion on the plain sentence at the
+-- held byte offset (deinflect every prefix, one batched sdcv, keep the
+-- longest hit), then a normal (is_sane=false) lookup — same as the page.
+
+local sdcv_batches = {}
+local sdcv_hits = {} -- term -> true means the "dictionary" knows it
+plugin.deinflector = {
+    deinflect = function(_, surface)
+        -- surface itself, plus a fake deinflection for た-forms
+        local cands = { { term = surface } }
+        local stem = surface:match("^(.-)た$")
+        if stem and stem ~= "" then cands[#cands + 1] = { term = stem .. "る" } end
+        return cands
+    end,
+}
+plugin.dictionary = {
+    rawSdcv = function(_, words)
+        sdcv_batches[#sdcv_batches + 1] = words
+        local results = {}
+        for i, w in ipairs(words) do
+            results[i] = sdcv_hits[w] and { { definition = "def of " .. w } } or {}
+        end
+        return false, results
+    end,
+}
+plugin.max_scan_length = 20
+
+-- 晴れた at offset of 晴: candidates 晴れ / 晴れた (+ deinflected 晴れる);
+-- the dictionary knows 晴れる, so the surface 晴れた wins (longest hit).
+sdcv_hits = { ["晴れる"] = true }
+dict_lookups = {}
+local hold_plain = "今日は晴れた。"
+popups[#popups].on_word_lookup(hold_plain, #"今日は", "晴", true)
+check(#sdcv_batches == 1 and #dict_lookups == 1
+        and dict_lookups[1].word == "晴れた" and dict_lookups[1].is_sane == false,
+    "a hold expands to the longest dictionary-known surface, like on the page: "
+        .. tostring(dict_lookups[1] and dict_lookups[1].word))
+
+-- No dictionary hit at all: fall back to the held atom's own text.
+sdcv_hits = {}
+dict_lookups = {}
+popups[#popups].on_word_lookup(hold_plain, #"今日は", "晴", true)
+check(#dict_lookups == 1 and dict_lookups[1].word == "晴"
+        and dict_lookups[1].is_sane == false,
+    "with no dictionary hit the held word itself is looked up")
+
+-- The scan stops at punctuation: a hold on the last word before 。 can only
+-- try up to it.
+sdcv_hits = { ["れた"] = true }
+dict_lookups = {}
+sdcv_batches = {}
+popups[#popups].on_word_lookup(hold_plain, #"今日は晴", "れ", true)
+local scanned_past_end = false
+for _, w in ipairs(sdcv_batches[1] or {}) do
+    if w:find("。", 1, true) then scanned_past_end = true end
+end
+check(not scanned_past_end and dict_lookups[1] and dict_lookups[1].word == "れた",
+    "the expansion scan stops at sentence punctuation")
+
+-- A dragged (multi-atom) selection skips the expansion and is looked up as
+-- selected.
+dict_lookups = {}
+sdcv_batches = {}
+popups[#popups].on_word_lookup(hold_plain, 0, " 今日は晴れた ", false)
+check(#sdcv_batches == 0 and dict_lookups[1]
+        and dict_lookups[1].word == "今日は晴れた" and dict_lookups[1].is_sane == false,
+    "a dragged selection is cleaned and looked up without expansion")
+
+-- ================= ruby size follows the style tweaks =====================
+
+ui.styletweak = {
+    enabled = true, -- the master "Enable style tweaks" switch
+    tweaks_by_id = {
+        ruby_font_size_larger = { css = "rt, rubyBox[T=rt] { font-size: 50% !important; }" },
+        some_other = { css = "p { font-size: 80%; }" },
+    },
+    isTweakEnabled = function(_, id) return id == "ruby_font_size_larger" end,
+}
+pages[1] = "一文目。二文目。三文目。"
+current_page = 1
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(popups[#popups].ruby_scale == 0.5,
+    "with 'Larger ruby text size' enabled the popup ruby follows it (50%)")
+-- The master switch off = the book renders default ruby; so does the popup.
+ui.styletweak.enabled = false
+ctrl:stop()
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(popups[#popups].ruby_scale == 0.42,
+    "with the master style-tweaks switch off the popup keeps the 42% default")
+ui.styletweak = nil
+pump()
+
+-- ============== double tap on the left eighth dismisses ===================
+
+ctrl:onKeyPress(fake_key("LPgFwd"))
+check(ctrl.popup ~= nil, "a popup is up")
+played_before = #played
+popups[#popups].on_frame_tap(true)
+popups[#popups].on_frame_tap(true)
+check(ctrl.popup == nil and #played == played_before,
+    "a double tap on the left eighth dismisses the popup without replaying")
+ctrl:onKeyPress(fake_key("LPgFwd"))
+played_before = #played
+popups[#popups].on_frame_tap(true)
+popups[#popups].on_frame_tap(false) -- second tap elsewhere: a normal double tap
+pump()
+check(ctrl.popup ~= nil and #played == played_before + 1,
+    "left + elsewhere still counts as a replay double tap")
+pump()
 
 -- ======================= local translator first ===========================
 
@@ -828,7 +1090,7 @@ pump(500)
 check(#local_calls >= 1 and local_calls[1].url == "http://loc:8087",
     "the local translator is tried first for sentence translations")
 check(#tr_calls == tr_google_b4, "…Google is not called when it succeeds")
-check(popups[#popups].text:find("LOCAL:ローカル翻訳の文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("LOCAL:ローカル翻訳の文。", 1, true) ~= nil,
     "…and its translation lands in the popup")
 
 local_fail = true
@@ -837,7 +1099,7 @@ current_page = 3
 ctrl:stop()
 ctrl:onKeyPress(fake_key("LPgFwd"))
 pump(500)
-check(popups[#popups].text:find("EN:フォールバックの文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("EN:フォールバックの文。", 1, true) ~= nil,
     "local server down: the Google fallback still translates")
 local_fail = false
 
@@ -847,7 +1109,7 @@ current_page = 3
 ctrl:stop()
 ctrl:onKeyPress(fake_key("LPgFwd"))
 pump(500)
-check(popups[#popups].text:find("LOCAL:オフラインローカルの文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("LOCAL:オフラインローカルの文。", 1, true) ~= nil,
     "offline with the local translator: translations keep working")
 net.online = true
 plugin.localTranslatorOpts = nil
@@ -894,7 +1156,7 @@ for _ = 1, 30 do
     pending_procs[pid] = nil
     pump(500)
 end
-check(popups[#popups].text:find("EN:二番目の文。", 1, true) ~= nil,
+check(popup_text(popups[#popups]):find("EN:二番目の文。", 1, true) ~= nil,
     "the current sentence's translation lands (never queued behind stale work)")
 ctrl:stop()
 ffistub.runInSubProcess = orig_run
